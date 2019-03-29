@@ -1,0 +1,1991 @@
+From da0ac064a8c30e000e4b4b299209cc98c86d1504 Mon Sep 17 00:00:00 2001
+From: Gary Oliver <go@aerodesic.com>
+Date: Fri, 4 May 2018 16:56:34 -0700
+Subject: [PATCH] Add FT8xx drivers to FBTFT suite
+
+---
+ drivers/staging/fbtft/Kconfig        |  12 +
+ drivers/staging/fbtft/Makefile       |   2 +
+ drivers/staging/fbtft/fb_ft801.c     | 425 +++++++++++++++++++++++
+ drivers/staging/fbtft/fb_ft801.h     | 322 ++++++++++++++++++
+ drivers/staging/fbtft/fb_ft81x.c     | 634 +++++++++++++++++++++++++++++++++++
+ drivers/staging/fbtft/fb_ft81x.h     | 420 +++++++++++++++++++++++
+ drivers/staging/fbtft/fbtft-core.c   |   6 +
+ drivers/staging/fbtft/fbtft.h        |   2 +
+ drivers/staging/fbtft/fbtft_device.c |  44 +++
+ 9 files changed, 1867 insertions(+)
+ create mode 100644 drivers/staging/fbtft/fb_ft801.c
+ create mode 100644 drivers/staging/fbtft/fb_ft801.h
+ create mode 100644 drivers/staging/fbtft/fb_ft81x.c
+ create mode 100644 drivers/staging/fbtft/fb_ft81x.h
+
+diff --git a/drivers/staging/fbtft/Kconfig b/drivers/staging/fbtft/Kconfig
+index dba6767..cc817ba 100644
+--- a/drivers/staging/fbtft/Kconfig
++++ b/drivers/staging/fbtft/Kconfig
+@@ -205,6 +205,18 @@ config FB_TFT_WATTEROTT
+ 	help
+ 	  Generic Framebuffer support for WATTEROTT
+ 
++config FB_TFT_FT801
++	tristate "FB driver for the FT801 LCD Controller"
++	depends on FB_TFT
++	help
++	  Generic Framebuffer support for FT801
++
++config FB_TFT_FT81x
++	tristate "FB driver for the FT81x LCD Controller"
++	depends on FB_TFT
++	help
++	  Generic Framebuffer support for FT81x
++
+ config FB_FLEX
+ 	tristate "Generic FB driver for TFT LCD displays"
+ 	depends on FB_TFT
+diff --git a/drivers/staging/fbtft/Makefile b/drivers/staging/fbtft/Makefile
+index 6bc0331..8708b93 100644
+--- a/drivers/staging/fbtft/Makefile
++++ b/drivers/staging/fbtft/Makefile
+@@ -37,6 +37,8 @@ obj-$(CONFIG_FB_TFT_UC1701)      += fb_uc1701.o
+ obj-$(CONFIG_FB_TFT_UPD161704)   += fb_upd161704.o
+ obj-$(CONFIG_FB_TFT_WATTEROTT)   += fb_watterott.o
+ obj-$(CONFIG_FB_FLEX)            += flexfb.o
++obj-$(CONFIG_FB_TFT_FT801)       += fb_ft801.o
++obj-$(CONFIG_FB_TFT_FT81x)       += fb_ft81x.o
+ 
+ # Device modules
+ obj-$(CONFIG_FB_TFT_FBTFT_DEVICE) += fbtft_device.o
+diff --git a/drivers/staging/fbtft/fb_ft801.c b/drivers/staging/fbtft/fb_ft801.c
+new file mode 100644
+index 0000000..ae4ceeb
+--- /dev/null
++++ b/drivers/staging/fbtft/fb_ft801.c
+@@ -0,0 +1,425 @@
++/*
++ * Custom FB driver for ft801 LCD controller
++ *
++ * Copyright (C) 2018 Gary Oliver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/gpio.h>
++#include <linux/delay.h>
++
++#include "fbtft.h"
++#include "fb_ft801.h"
++
++#define DRVNAME			"fb_ft801"
++#define WIDTH			480
++#define HEIGHT			272
++#define DEFAULT_BRIGHTNESS	50
++
++static int window_xstart;
++static int window_xend;
++static int window_ystart;
++static int window_yend;
++
++#define PD_PIN			gpio.aux[0]
++#define INT_PIN			gpio.aux[1]
++
++/* A read function that knows how to handle register reads for ft801
++ *
++ * Preload the buffer with the register address + a zero byte.
++ * Data is written and read on top of the source buffer.
++ */
++static int ft801_read_register(struct fbtft_par *par, unsigned int address, u32 *value, size_t valsize)
++{
++	int ret;
++	u8 txbuf[32] = { 0, };
++	u8 rxbuf[32];
++
++	struct spi_transfer	t = {
++			.speed_hz	= 11000000,
++			.rx_buf		= rxbuf,
++			.tx_buf		= txbuf,
++			.len		= 8
++		};
++	struct spi_message	m;
++
++	if (!par->spi) {
++		dev_err(par->info->device,
++			"%s: par->spi is unexpectedly NULL\n", __func__);
++		return -ENODEV;
++	}
++
++	txbuf[0] = address >> 16;
++	txbuf[1] = address >> 8;
++	txbuf[2] = address >> 0;
++	txbuf[3] = 0;
++
++	spi_message_init(&m);
++	spi_message_add_tail(&t, &m);
++	ret = spi_sync(par->spi, &m);
++
++	switch (address & REG_LEN_MASK) {
++		case REG_8_BYTES:
++			memcpy(value, rxbuf+4, valsize);
++			break;
++		case REG_4_BYTES:
++			* value = (u32) rxbuf[7] << 24 | (u32) rxbuf[6] << 16 |
++				  (u32) rxbuf[5] << 8 | (u32) rxbuf[4];
++			break;
++		case REG_3_BYTES:
++			* value = (u32) rxbuf[6] << 16 | (u32) rxbuf[5] << 8 |
++				  (u32) rxbuf[4];
++			break;
++		case REG_2_BYTES:
++			* value = (u32) rxbuf[5] << 8 | (u32) rxbuf[4];
++			break;
++		case REG_1_BYTE:
++			* value = (u32) rxbuf[4];
++			break;
++		default:
++			break;
++	}
++
++	fbtft_par_dbg_hex(DEBUG_READ, par, par->info->device, u8, txbuf, t.len,
++		"%s(len=%d) OUT: ", __func__, t.len);
++
++	fbtft_par_dbg_hex(DEBUG_READ, par, par->info->device, u8, rxbuf, t.len,
++		"%s(len=%d) IN:  ", __func__, t.len);
++
++	return ret;
++}
++/*
++ * A write register that just writes the items as u8 bytes to device.
++ */
++static void ft801_write_register(struct fbtft_par *par, int len, ...)
++{
++	va_list args;
++	int i, ret;
++	u8 *buf = (u8 *)par->buf;
++
++	/* Copy items to holding buffer */
++	va_start(args, len);
++	for (i = 0; i < len; i++) {
++		buf[i] = (u8) va_arg(args, unsigned int);
++	}
++	va_end(args);
++
++	/* Dump contents if debug enabled */
++	if (unlikely(par->debug & DEBUG_WRITE_REGISTER)) {
++		fbtft_par_dbg_hex(DEBUG_WRITE_REGISTER, par, par->info->device, u8, buf, len, "%s: ", __func__);
++	}
++
++	if (len) {
++		ret = par->fbtftops.write(par, buf, len * sizeof(u8));
++		if (ret < 0) {
++			va_end(args);
++			dev_err(par->info->device, "%s: write() failed and returned %d\n", __func__, ret);
++			return;
++		}
++	}
++}
++
++static void ft801_write_8bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value);
++}
++
++static void ft801_write_16bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8);
++}
++
++static void write_24bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8, value >> 16);
++}
++
++static void ft801_write_32bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8, value >> 16, value >> 24);
++}
++
++#ifdef CONFIG_FB_BACKLIGHT
++static int ft801_backlight_chip_update_status(struct backlight_device *bd)
++{
++	struct fbtft_par *par = bl_get_data(bd);
++	int brightness = bd->props.brightness;
++
++	fbtft_par_dbg(DEBUG_BACKLIGHT, par,
++		"%s: brightness=%d, power=%d, fb_blank=%d\n",
++		__func__, bd->props.brightness, bd->props.power,
++		bd->props.fb_blank);
++
++	if (bd->props.power != FB_BLANK_UNBLANK)
++		brightness = 0;
++
++	if (bd->props.fb_blank != FB_BLANK_UNBLANK)
++		brightness = 0;
++
++	ft801_write_8bits(par, REG_PWM_DUTY, (brightness * 127) / 100);
++
++	return 0;
++}
++
++static const struct backlight_ops bl_ops = {
++	.update_status = ft801_backlight_chip_update_status,
++};
++
++static void ft801_register_chip_backlight(struct fbtft_par *par)
++{
++	struct backlight_device *bd;
++	struct backlight_properties bl_props = { 0, };
++
++	bl_props.type = BACKLIGHT_RAW;
++	bl_props.power = FB_BLANK_POWERDOWN;
++	bl_props.max_brightness = 100;
++	bl_props.brightness = DEFAULT_BRIGHTNESS;
++
++	bd = backlight_device_register(dev_driver_string(par->info->device),
++				par->info->device, par, &bl_ops, &bl_props);
++	if (IS_ERR(bd)) {
++		dev_err(par->info->device,
++			"cannot register backlight device (%ld)\n",
++			PTR_ERR(bd));
++		return;
++	}
++	par->info->bl_dev = bd;
++
++	if (!par->fbtftops.unregister_backlight)
++		par->fbtftops.unregister_backlight = fbtft_unregister_backlight;
++}
++#else
++#define ft801_register_chip_backlight NULL
++#endif
++
++static void wait_display_list_available(struct fbtft_par *par)
++{
++	uint32_t dlswap;
++	do {
++		ft801_read_register(par, REG_DLSWAP, &dlswap, sizeof(dlswap));
++		if (dlswap != 0) {
++			fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s(waiting for dlswap)", __func__);
++			udelay(100);
++		}
++	} while (dlswap != 0);
++}
++
++static int ft801_init_display(struct fbtft_par *par)
++{
++	int ret;
++
++	fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s()\n", __func__);
++
++	par->fbtftops.reset(par);
++
++	/* Send reset */
++	write_reg(par, CMD_CORERST, 0, 0);
++	mdelay(20);
++	write_reg(par, CMD_CLKEXT, 0, 0);    // External clock
++	write_reg(par, CMD_ACTIVE, 0, 0);
++	mdelay(20);
++
++	ft801_write_16bits(par, REG_HCYCLE, 548);
++	ft801_write_16bits(par, REG_HOFFSET, 43);
++	ft801_write_16bits(par, REG_HSYNC0, 0);
++	ft801_write_16bits(par, REG_HSYNC1, 41);
++	ft801_write_16bits(par, REG_VCYCLE, 292);
++	ft801_write_16bits(par, REG_VOFFSET, 12);
++	ft801_write_16bits(par, REG_VSYNC0, 0);
++	ft801_write_16bits(par, REG_VSYNC1, 10);
++	ft801_write_8bits(par, REG_SWIZZLE, 0);
++	ft801_write_8bits(par, REG_PCLK_POL, 1);
++	ft801_write_8bits(par, REG_CSPREAD, 1);
++	ft801_write_8bits(par, REG_DITHER, 1);
++	ft801_write_16bits(par, REG_HSIZE, WIDTH);
++	ft801_write_16bits(par, REG_VSIZE, HEIGHT);
++
++	wait_display_list_available(par);
++
++	/* Create the display list for generating the image */
++	START_RAM_DL(10, RAM_DL)
++		WRITE_RAM_DL(RAM_DL_CLEAR_COLOR_RGB(0,0,0));
++		WRITE_RAM_DL(RAM_DL_CLEAR(CLEAR_COLOR_BUFFER | CLEAR_STENCIL_BUFFER | CLEAR_TAG_BUFFER));
++		WRITE_RAM_DL(RAM_DL_BITMAP_SOURCE(RAM_G));
++		WRITE_RAM_DL(RAM_DL_BITMAP_LAYOUT(BITMAP_LAYOUT_RGB565, 2*WIDTH, HEIGHT));
++		WRITE_RAM_DL(RAM_DL_BITMAP_SIZE(BITMAP_SIZE_NEAREST, BITMAP_SIZE_BORDER, BITMAP_SIZE_BORDER, WIDTH, HEIGHT));
++		WRITE_RAM_DL(RAM_DL_BEGIN(BEGIN_BITMAPS));
++		WRITE_RAM_DL(RAM_DL_VERTEX2II(0, 0, 0, 0));
++		WRITE_RAM_DL(RAM_DL_END());
++		WRITE_RAM_DL(RAM_DL_DISPLAY());
++	ret = END_RAM_DL(par);
++
++	if (ret == 0) {
++		u32 gpio;
++		u32 id;
++		u32 frequency;
++
++		ft801_write_8bits(par, REG_DLSWAP, DLSWAP_FRAME);
++
++		/* Enable display */
++		ft801_read_register(par, REG_GPIO_DIR, &gpio, sizeof(gpio));
++		gpio |= 0x80;
++		ft801_write_8bits(par, REG_GPIO_DIR, gpio);
++		ft801_read_register(par, REG_GPIO, &gpio, sizeof(gpio));
++		gpio |= 0x80;
++		ft801_write_8bits(par, REG_GPIO, gpio);
++
++		ft801_write_8bits(par, REG_PCLK, 5);
++
++		ft801_read_register(par, REG_ID, &id, sizeof(id));
++		ft801_read_register(par, REG_FREQUENCY, &frequency, sizeof(frequency));
++		ft801_read_register(par, REG_GPIO, &gpio, sizeof(gpio));
++
++		fbtft_par_dbg(DEBUG_INIT_DISPLAY, par,
++			"%s(id=%x, frequency=%d, gpio=%x)\n", __func__, id, frequency, gpio);
++	} else {
++		dev_err(par->info->device,
++			"%s: failure to write ramdl\n", __func__);
++	}
++	return ret;
++}
++
++int ft801_write_vmem(struct fbtft_par *par, size_t offset, size_t len)
++{
++	u16 *vmem;
++	size_t remain;
++	int ret = 0;
++	u32 address = RAM_G + offset;
++
++	fbtft_par_dbg(DEBUG_WRITE_VMEM, par, "%s(offset=%zu, len=%zu)\n",
++		__func__, offset, len);
++
++	remain = len / 2; /* Number of pixels remaining */
++	vmem = (u16 *)(par->info->screen_buffer + offset);
++
++	wait_display_list_available(par);
++
++	if (!par->txbuf.buf) {
++		/* Non buffered write */
++		ret = par->fbtftops.write(par, vmem, len);
++	} else {
++		/* buffered write - allow room for address header (3 bytes) */
++		size_t tx_array_size = (par->txbuf.len - 3) / 2;
++
++		while (remain && ret >= 0) {
++			u8* txptr = par->txbuf.buf;
++			int i;
++			size_t to_copy = min(tx_array_size, remain);
++
++			dev_dbg(par->info->device, "    to_copy=%zu, remain=%zu\n",
++							to_copy, remain - to_copy);
++
++			/* Load the address */
++			*txptr++ = (u8) (address >> 16) | 0x80;
++			*txptr++ = (u8) (address >> 8);
++			*txptr++ = (u8) (address >> 0);
++
++			for (i = 0; i < to_copy; i++) {
++				u16 pixel = cpu_to_be16(vmem[i]);
++				*txptr++ = (u8) (pixel >> 8);
++				*txptr++ = (u8) (pixel >> 0);
++			}
++
++			ret = par->fbtftops.write(par, par->txbuf.buf, (txptr - (u8*) par->txbuf.buf));
++
++			vmem = vmem + to_copy;
++			remain -= to_copy;
++			address += to_copy * 2;
++		}
++	}
++
++	return ret;
++}
++
++static void ft801_set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
++{
++	fbtft_par_dbg(DEBUG_SET_ADDR_WIN, par,
++		"%s(xs=%d, ys=%d, xe=%d, ye=%d)\n", __func__, xs, ys, xe, ye);
++
++	/* Remember this boundary */
++	window_xstart = xs;
++	window_ystart = ys;
++	window_xend = xe;
++	window_yend = ye;
++}
++
++static int ft801_set_var(struct fbtft_par *par)
++{
++	fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s()\n", __func__);
++
++	switch (par->info->var.rotate) {
++	case 270:
++		break;
++	case 180:
++		ft801_write_8bits(par, REG_ROTATE, 1);
++		break;
++	case 90:
++		break;
++	default:
++		ft801_write_8bits(par, REG_ROTATE, 0);
++		break;
++	}
++
++	return 0;
++}
++
++static unsigned long
++ft801_request_gpios_match(struct fbtft_par *par, const struct fbtft_gpio *gpio)
++{
++	dev_dbg(par->info->device,
++		"%s('%s')\n", __func__, gpio->name);
++
++	if (strcasecmp(gpio->name, "pd") == 0) {
++		/* Powerdown pin */
++		par->PD_PIN = gpio->gpio;
++		return GPIOF_OUT_INIT_HIGH;
++	} else if (strcasecmp(gpio->name, "int") == 0) {
++		/* Interrupt input pin */
++		par->INT_PIN = gpio->gpio;
++		return GPIOF_IN;
++	}
++
++	return FBTFT_GPIO_NO_MATCH;
++}
++
++static struct fbtft_display display = {
++	.regwidth = 8,
++	.txbuflen = 65536,
++	.width    = WIDTH,
++	.height   = HEIGHT,
++	.fbtftops = {
++		.init_display        = ft801_init_display,
++	//	.deinit_display      = ft801_deinit_display.
++		.set_addr_win        = ft801_set_addr_win,
++		.write_register      = ft801_write_register,
++		.write_vmem          = ft801_write_vmem,
++		.set_var             = ft801_set_var,
++		.register_backlight  = ft801_register_chip_backlight,
++		.request_gpios_match = ft801_request_gpios_match,
++	},
++};
++
++FBTFT_REGISTER_DRIVER(DRVNAME, "ftdi,ft801", &display);
++
++MODULE_ALIAS("spi:" DRVNAME);
++MODULE_ALIAS("spi:ft801");
++
++MODULE_DESCRIPTION("Custom FB driver for ft801 display");
++MODULE_AUTHOR("Gary Oliver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/staging/fbtft/fb_ft801.h b/drivers/staging/fbtft/fb_ft801.h
+new file mode 100644
+index 0000000..0cfd0ed
+--- /dev/null
++++ b/drivers/staging/fbtft/fb_ft801.h
+@@ -0,0 +1,322 @@
++/*
++ * fb_ft801.h
++ *
++ * Defines for ft801 device
++ */
++#ifndef __fb_ft801_h_included
++#define __fb_ft801_h_included
++
++/*
++ * Commands
++ *
++ * These are one-byte commands with two bytes of (user supplied) 0 after the first byte.
++ */
++
++#define CMD_ACTIVE                    0x00                          // Enter active mode
++#define CMD_STANDBY                   0x41                          // Enter standby mode (default)
++#define CMD_SLEEP                     0x42                          // Enter sleep mode
++#define CMD_PWRDOWN                   0x50                          // Enter power down mode
++#define CMD_CLKEXT                    0x44                          // Use external clock
++#define CMD_CLKINT                    0x48                          // Use internal clock
++#define CMD_CLK48M                    0x62                          // Switch PLL to 48 MHz (default)
++#define CMD_CLK36M                    0x61                          // Switch PLL to 36 MHz
++#define CMD_CORERST                   0x68                          // Core reset
++
++#define RAM_G                         0x00000000 // - 0x03FFFF
++#define ROM_CHIPID                    0x000C0000 // - 0x0C0003
++#define ROM_FONT                      0x000BB23C // - 0x0FFFFB
++#define ROM_FONT_ADDR                 0x000FFFFB // - 0x0FFFFF
++#define RAM_DL                        0x00100000 // - 0x101FFF
++#define RAM_PAL                       0x00102000 // - 0x1023FF
++#define REG_REGISTERS_BASE            0x00102400 // - 0x10257F
++#define RAM_CMD                       0x00108000 // - 0x108FFF
++#define RAM_SCREENSHOT                0x001C2000 // - 0x1C27FF
++
++#define REG_1_BYTE                    0x01000000 // - one byte value
++#define REG_2_BYTES                   0x02000000 // - two byte value
++#define REG_3_BYTES                   0x03000000 // - three byte value
++#define REG_4_BYTES                   0x04000000 // - four byte value
++#define REG_8_BYTES                   0x08000000 // - eight byte value
++#define REG_LEN_MASK                  0x0F000000 // mask for length field
++#define REG_ADDR_MASK                 0x003FFFFF // mask for address field
++
++/*
++ * RAM_DL commands:
++ */
++#define START_RAM_DL(size, addr) { u8 __ramdlbuf__[((size)*4)+3]; size_t index = 3; int __out_of_room__ = 0; \
++					__ramdlbuf__[0] = (((addr) >> 16) & 0xFF) | 0x80; \
++					__ramdlbuf__[1] = ((addr) >> 8) & 0xFF; \
++					__ramdlbuf__[2] = ((addr) >> 0) & 0xFF; \
++
++#define WRITE_RAM_DL(f) \
++		if (index <= sizeof(__ramdlbuf__) - 3) { \
++			__ramdlbuf__[index+0] = ((f)>>0) & 0xFF; \
++			__ramdlbuf__[index+1] = ((f)>>8) & 0xFF; \
++			__ramdlbuf__[index+2] = ((f)>>16) & 0xFF; \
++			__ramdlbuf__[index+3] = ((f)>>24) & 0xFF; \
++			index += 4; \
++		} else { \
++			__out_of_room__=-99; \
++		}
++
++#define END_RAM_DL(par) (__out_of_room__ || par->fbtftops.write(par, __ramdlbuf__, index)); }
++
++#define RAM_DL_DISPLAY()			((0x00<<24))
++
++#define RAM_DL_BITMAP_SOURCE(addr)	((0x01<<24) | ((addr)<<0))
++
++#define RAM_DL_CLEAR_COLOR_RGB(r,g,b)	((0x02<<24) | ((r)<<16) | ((b)<<8) | ((g)<<0))
++
++#define RAM_DL_TAG(s)			((0x03<<24) | ((s)<<0))
++
++#define RAM_DL_COLOR_RGB(r,g,b)		((0x04<<24) | ((r)<<16) | ((b)<<8) | ((g)<<0))
++
++#define RAM_DL_BITMAP_HANDLE(handle)	((0x05<<24) | ((handle)<<0))
++
++#define RAM_DL_CELL(cell)		((0x06<<24) | ((cell)<<0))
++
++#define RAM_DL_BITMAP_LAYOUT(f, s, h)	((0x07<<24) | ((f)<<19) | ((s)<<9) | ((h)<<0))
++#define BITMAP_LAYOUT_ARGB1555		0
++#define BITMAP_LAYOUT_L1		1
++#define BITMAP_LAYOUT_L4		2
++#define BITMAP_LAYOUT_L8		3
++#define BITMAP_LAYOUT_RGB332		4
++#define BITMAP_LAYOUT_ARGB2		5
++#define BITMAP_LAYOUT_ARGB4		6
++#define BITMAP_LAYOUT_RGB565		7
++#define BITMAP_LAYOUT_PALETTED		8
++#define BITMAP_LAYOUT_TEXT8X8		9
++#define BITMAP_LAYOUT_TEXTVGA		10
++#define BITMAP_LAYOUT_BARGRAPH		11
++
++#define RAM_DL_BITMAP_SIZE(f, wrx, wry, w, h)	((0x08<<24) | ((f)<<20) | ((wrx)<<19) | ((wry)<<18) | ((w)<<9) | ((h)<<0))
++#define BITMAP_SIZE_NEAREST		0
++#define BITMAP_SIZE_BILINEAR		1
++#define BITMAP_SIZE_BORDER		0
++#define BITMAP_SIZE_REPEAT		1
++
++#define RAM_DL_ALPH_FUNC(func, ref)	((0x09<<24) | ((func)<<8) | ((ref)<<0))
++#define ALPHA_FUNC_NEVER		0
++#define ALPHA_FUNC_LESS			1
++#define ALPHA_FUNC_LEQUAL		2
++#define ALPHA_FUNC_GREATER		3
++#define ALPHA_FUNC_GEQUAL		4
++#define ALPHA_FUNC_EQUAL		5
++#define ALPHA_FUNC_NOTEQUAL		6
++#define ALPHA_FUNC_ALWAYS		7
++
++#define RAM_DL_STENCIL_FUNC(func,ref,mask)	((0x0A<<24) | ((func)<<16) | ((ref)<<8) | ((mask)<<0))
++#define STENCIL_FUNC_NEVER		0
++#define STENCIL_FUNC_LESS		1
++#define STENCIL_FUNC_LEQUAL		2
++#define STENCIL_FUNC_GREATER		3
++#define STENCIL_FUNC_GEQUAL		4
++#define STENCIL_FUNC_EQUAL		5
++#define STENCIL_FUNC_NOTEQUAL		6
++#define STENCIL_FUNC_ALWAYS		7
++
++#define RAM_DL_BLEND_FUNC(src, dst)	((0x0B<<24) | ((src)<<3) | ((dst)<<0))
++#define BLEND_FUNC_ZERO			0
++#define BLEND_FUNC_ONE			1
++#define BLEND_FUNC_SRC_ALPHA		2
++#define BLEND_FUNC_DST_ALPHA		3
++#define BLEND_FUNC_ONE_MINUS_SRC_ALPHA	4
++#define BLEND_FUNC_ONE_MINUS_DST_ALPHA	5
++
++#define RAM_DL_STENCIL_OP(fail,pass)	((0x0C<<24) | ((fail)<<3) | ((pass)<<0))
++#define STENCIL_OP_ZERO			0
++#define STENCIL_OP_KEEP			1
++#define STENCIL_OP_REPLACE		2
++#define STENCIL_OP_INCR			3
++#define STENCIL_OP_DECR			4
++#define STENCIL_OP_INVERT		5
++
++#define RAM_DL_POINT_SIZE(s)		((0x0D<<24) | ((s)<<0))
++
++#define RAM_DL_LINE_WIDTH(w)		((0x0E<<24) | ((w)<<0))
++
++#define RAM_DL_CLEAR_COLOR_A(alpha)	((0x0F<<24) | ((alpha)<<0))
++
++#define RAM_DL_COLOR_A(alpha)		((0x10<<24) | ((alpha)<<0))
++
++#define RAM_DL_CLEAR_STENCIL(s)		((0x11<<24) | ((s)<<0))
++
++#define RAM_DL_CLEAR_TAG(t)		((0x12<<24) | ((t)<<0))
++
++#define RAM_DL_STENCIL_MASK(m)		((0x13<<24) | ((m)<<0))
++
++#define RAM_DL_TAG_MASK(m)		((0x14<<24) | ((m)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_A(a)	((0x15<<24) | ((a)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_B(b)	((0x16<<24) | ((b)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_C(c)	((0x17<<24) | ((c)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_D(d)	((0x18<<24) | ((d)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_E(e)	((0x19<<24) | ((e)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_F(f)	((0x1A<<24) | ((f)<<0))
++
++#define RAM_DL_SCISSOR_XY(x, y)		((0x1B<<24) | ((x)<<9) | ((y)<<0))
++
++#define RAM_DL_SCISSOR_SIZE(w,h)	((0x1C<<24) | ((w)<<10) | ((h)<<0))
++
++#define RAM_DL_CALL(addr)		((0x1D<<24) | ((addr)<<0))
++
++#define RAM_DL_JUMP(dest)		((0x1E<<24) | ((dest)<<0))
++
++#define RAM_DL_BEGIN(prim)		((0x1F<<24) | ((prim)<<0))
++#define BEGIN_BITMAPS			1
++#define BEGIN_POINTS			2
++#define BEGIN_LINES			3
++#define BEGIN_LINE_STRIP		4
++#define BEGIN_EDGE_STRIP_R		5
++#define BEGIN_EDGE_STRIP_L		6
++#define BEGIN_EDGE_STRIP_A		7
++#define BEGIN_EDGE_STRIP_B		8
++#define BEGIN_RECTS			9
++
++#define RAM_DL_COLOR_MASK(color)	((0x20<<24) | ((color)<<0))
++#define COLOR_MASK_R			0x08
++#define COLOR_MASK_G			0x04
++#define COLOR_MASK_B			0x02
++#define COLOR_MASK_A			0x01
++
++#define RAM_DL_END()			((0x21<<24))
++
++#define RAM_DL_SAVE_CONTEXT()		((0x22<<24))
++
++#define RAM_DL_RESTORE_CONTEXT()		((0x23<<24))
++
++#define RAM_DL_RETURN()			((0x24<<24))
++
++#define RAM_DL_MACRO(n)			((0x25<<24) | ((n)<<0))
++
++#define RAM_DL_CLEAR(flags)		((0x26<<24) | ((flags)<<0))
++#define CLEAR_COLOR_BUFFER		0x04
++#define CLEAR_STENCIL_BUFFER		0x02
++#define CLEAR_TAG_BUFFER		0x01
++
++#define RAM_DL_VERTEX2F(x,y)		((0x1<<30) | ((x)<<15) | ((y)<<0))
++
++#define RAM_DL_VERTEX2II(x,y,h,c)	((0x2<<30) | ((x)<<21) | ((y)<<12) | ((h)<<7) | ((c)<<0))
++
++
++
++//      Name                          Offset                                   // Bits  Access  Reset Value  Description
++#define REG_ID                        (REG_REGISTERS_BASE+0x000+REG_1_BYTE)    //   8     r/o    0x7C        ID register
++#define REG_FRAMES                    (REG_REGISTERS_BASE+0x004+REG_4_BYTES)   //  32     r/o    0x00000000  Frame counter since reset
++#define REG_CLOCK                     (REG_REGISTERS_BASE+0x008+REG_4_BYTES)   //  32     r/o    0x00000000  Clock cycles since reset
++#define REG_FREQUENCY                 (REG_REGISTERS_BASE+0x00C+REG_4_BYTES)   //  27     r/w    48000000    Main clock frequency
++#define REG_SCREENSHOT_EN             (REG_REGISTERS_BASE+0x010+REG_1_BYTE)    //   1     r/w    0           Set to enable screenshot
++#define REG_SCREENSHOT_Y              (REG_REGISTERS_BASE+0x014+REG_2_BYTES)   //   9     r/w    0           Line number for screenshot
++#define REG_SCREENSHOT_START          (REG_REGISTERS_BASE+0x018+REG_1_BYTE)    //   1     r/w    0           Set to start screenshot
++#define REG_CPURESET                  (REG_REGISTERS_BASE+0x01C+REG_1_BYTE)    //   1     r/w    0           Device reset
++#define REG_TAP_CRC                   (REG_REGISTERS_BASE+0x020+REG_4_BYTES)   //  32     r/o    -           Live video tap crc; computed every DL_SWAP
++#define REG_TAP_MASK                  (REG_REGISTERS_BASE+0x024+REG_4_BYTES)   //  32     r/w    0xFFFFFFFF  Live video tap mask
++#define REG_HCYCLE                    (REG_REGISTERS_BASE+0x028+REG_2_BYTES)   //  10     r/w    0x224       Horizontal total cycle count
++#define REG_HOFFSET                   (REG_REGISTERS_BASE+0x02C+REG_2_BYTES)   //  10     r/w    0x2B        Horizontal display start offset
++#define REG_HSIZE                     (REG_REGISTERS_BASE+0x030+REG_2_BYTES)   //  10     r/w    0x1E0       Horizontal display pixel count
++#define REG_HSYNC0                    (REG_REGISTERS_BASE+0x034+REG_2_BYTES)   //  10     r/w    0x000       Horizontal sync fall offset
++#define REG_HSYNC1                    (REG_REGISTERS_BASE+0x038+REG_2_BYTES)   //  10     r/w    0x029       Horizontal sync rise offset
++#define REG_VCYCLE                    (REG_REGISTERS_BASE+0x03C+REG_2_BYTES)   //  10     r/w    0x124       Vertical total cycle count
++#define REG_VOFFSET                   (REG_REGISTERS_BASE+0x040+REG_2_BYTES)   //  10     r/w    0x00C       Vertical display start offset
++#define REG_VSIZE                     (REG_REGISTERS_BASE+0x044+REG_2_BYTES)   //  10     r/w    0x110       Vertical display line count
++#define REG_VSYNC0                    (REG_REGISTERS_BASE+0x048+REG_2_BYTES)   //  10     r/w    0x000       Vertical sync fall offset
++#define REG_VSYNC1                    (REG_REGISTERS_BASE+0x04C+REG_2_BYTES)   //  10     r/w    0x00A       Vertical sync rise offset
++#define REG_DLSWAP                    (REG_REGISTERS_BASE+0x050+REG_1_BYTE)    //   2     r/w    0           Display list swap control
++#define DLSWAP_LINE	0x01	/* Swap at next line */
++#define DLSWAP_FRAME	0x02	/* Swap at next frame */
++#define REG_ROTATE                    (REG_REGISTERS_BASE+0x054+REG_1_BYTE)    //   1     r/w    0           Set to rotate screen 180 degrees
++#define REG_OUTBITS                   (REG_REGISTERS_BASE+0x058+REG_2_BYTES)   //   9     r/w    0x1B6       Output bit resolution (3x3x3)
++#define REG_DITHER                    (REG_REGISTERS_BASE+0x05C+REG_1_BYTE)    //   1     r/w    0           Set to enable dither
++#define REG_SWIZZLE                   (REG_REGISTERS_BASE+0x060+REG_1_BYTE)    //   4     r/w    0x0         Output RGB signal swizzle
++#define REG_CSPREAD                   (REG_REGISTERS_BASE+0x064+REG_1_BYTE)    //   1     r/w    1           Output clock spreading enable
++#define REG_PCLK_POL                  (REG_REGISTERS_BASE+0x068+REG_1_BYTE)    //   1     r/w    0           PCLK polarity;0 PCLK rising; 1 PCLK falling
++#define REG_PCLK                      (REG_REGISTERS_BASE+0x06C+REG_1_BYTE)    //   8     r/w    0x00        PCLK frequency divider, 0 = disable
++#define REG_TAG_X                     (REG_REGISTERS_BASE+0x070+REG_2_BYTES)   //   9     r/w    0x000       Tag query X coordinate
++#define REG_TAG_Y                     (REG_REGISTERS_BASE+0x074+REG_2_BYTES)   //   9     r/w    0x000       Tag query Y coordinate
++#define REG_TAG                       (REG_REGISTERS_BASE+0x078+REG_1_BYTE)    //   8     r/o    0x00        Tag query result
++#define REG_VOL_PB                    (REG_REGISTERS_BASE+0x07C+REG_1_BYTE)    //   8     r/w    0xFF        Volume for playback
++#define REG_VOL_SOUND                 (REG_REGISTERS_BASE+0x080+REG_1_BYTE)    //   8     r/w    0xFF        Volume for synthesizer sound
++#define REG_SOUND                     (REG_REGISTERS_BASE+0x084+REG_2_BYTES)   //  16     r/w    0x0000      Sound effect select
++#define REG_PLAY                      (REG_REGISTERS_BASE+0x088+REG_1_BYTE)    //   1     r/w    0           Start effect playback
++#define REG_GPIO_DIR                  (REG_REGISTERS_BASE+0x08C+REG_1_BYTE)    //   8     r/w    0x80        GPIO Pin direction; 0=IN; 1=OUT
++#define REG_GPIO                      (REG_REGISTERS_BASE+0x090+REG_1_BYTE)    //   8     r/w    0x00        GPIO pin value (bit 0,1,7); strength on 2-6
++// Reserved                           (REG_REGISTERS_BASE+0x094)
++#define REG_INT_FLAGS                 (REG_REGISTERS_BASE+0x098+REG_1_BYTE)    //   8     r/o    0x00        Interrupt flash; clear by reading
++#define REG_INT_EN                    (REG_REGISTERS_BASE+0x09C+REG_1_BYTE)    //   1     r/w    0           Global interrupt enable
++#define REG_INT_MASK                  (REG_REGISTERS_BASE+0x0A0+REG_1_BYTE)    //   8     r/w    0xFF        Interrupt enable mask
++#define  INT_MASK_SWAP		0x01
++#define  INT_MASK_TOUCH		0x02
++#define  INT_MASK_TAG		0x04
++#define  INT_MASK_SOUND		0x08
++#define  INT_MASK_PLAYBACK	0x10
++#define  INT_MASK_CMDEMPTY	0x20
++#define  INT_MASK_CMDFLAG	0x40
++#define  INT_MASK_CONVCOMPLETE	0x80
++#define REG_PLAYBACK_START            (REG_REGISTERS_BASE+0x0A4+REG_3_BYTES)   //  20     r/w    0x00000     Audio playback RAM start address
++#define REG_PLAYBACK_LENGTH           (REG_REGISTERS_BASE+0x0A8+REG_3_BYTES)   //  20     r/w    0x00000     Audio playback sample length (bytes)
++#define REG_PLAYBACK_READPTR          (REG_REGISTERS_BASE+0x0AC+REG_3_BYTES)   //  20     r/o    -           Audio playback current read pointer
++#define REG_PLAYBACK_FREQ             (REG_REGISTERS_BASE+0x0B0+REG_2_BYTES)   //  16     r/w    8000        Audio playback sampling frequency
++#define REG_PLAYBACK_FORMAT           (REG_REGISTERS_BASE+0x0B4+REG_1_BYTE)    //   2     r/w    0           Audio playback format
++#define REG_PLAYBACK_LOOP             (REG_REGISTERS_BASE+0x0B8+REG_1_BYTE)    //   1     r/w    0           Audio playback loop enable
++#define REG_PLAYBACK_PLAY             (REG_REGISTERS_BASE+0x0BC+REG_1_BYTE)    //   1     r/o    0           Start audio playback
++#define REG_PWM_HZ                    (REG_REGISTERS_BASE+0x0C0+REG_2_BYTES)   //  14     r/w    250         BACKLIGHT PWM output frequency (Hz)
++#define REG_PWM_DUTY                  (REG_REGISTERS_BASE+0x0C4+REG_1_BYTE)    //   8     r/w    128         BACKLIGHT PWM output duty cycle 0=0%, 128=100%
++#define REG_MACRO_0                   (REG_REGISTERS_BASE+0x0C8+REG_4_BYTES)   //  32     r/w    0x00000000  Display list macro command 0
++#define REG_MACRO_1                   (REG_REGISTERS_BASE+0x0CC+REG_4_BYTES)   //  32     r/w    0x00000000  Display list macro command 1
++// Reserved                           (REG_REGISTERS_BASE+0x0D0)
++// Reserved                           (REG_REGISTERS_BASE+0x0D4)
++#define REG_SCREENSHOT_BUSY           (REG_REGISTERS_BASE+0x0D8+REG_8_BYTES)   //  64     r/o    -           Screenshot ready flags
++//                                    (REG_REGISTERS_BASE+0x0DC                //  Second half of above
++// Reserved                           (REG_REGISTERS_BASE+0x0E0)
++#define REG_CMD_READ                  (REG_REGISTERS_BASE+0x0E4+REG_2_BYTES)   //  12     r/w    0           Command buffer read pointer
++#define REG_CMD_WRITE                 (REG_REGISTERS_BASE+0x0E8+REG_2_BYTES)   //  12     r/w    0           Command buffer write pointef
++#define REG_CMD_DL                    (REG_REGISTERS_BASE+0x0EC+REG_2_BYTES)   //  13     r/w    0           Command display list offset
++#define REG_TOUCH_MODE                (REG_REGISTERS_BASE+0x0F0+REG_1_BYTE)    //   2     r/w    3           Touch-screen sampling mode
++#define  TOUCH_MODE_OFF		0
++#define  TOUCH_MODE_ONE_SHOT	1
++#define  TOUCH_MODE_FRAME_SYNC	2
++#define  TOUCH_MODE_CONTINUOUS	3
++#define REG_CTOUCH_EXTENDED           (REG_REGISTERS_BASE+0x0F4+REG_1_BYTE)    //   1     r/w    1           Capacitive touch mode: 0:multitouch 1:single
++#define REG_CTOUCH_REG                (REG_REGISTERS_BASE+0x0F8+REG_2_BYTES)   //  16     r/w    0x1770      CTPM configure register write; 7:0=address; 15:8=value
++// Reserved                           (REG_REGISTERS_BASE+0x0FC)
++// Reserved                           (REG_REGISTERS_BASE+0x100)
++// Reserved                           (REG_REGISTERS_BASE+0x104)
++#define REG_CTOUCH_RAW_XY             (REG_REGISTERS_BASE+0x108+REG_4_BYTES)   //  32     r/o    -           Touch screen raw; msb16=x; lsb16=y (multitouch = touch 1)
++#define REG_CTOUCH_TOUCH1_XY              REG_CTOUCH_RAW_XY
++#define REG_CTOUCH_TOUCH4_Y           (REG_REGISTERS_BASE+0x10C+REG_4_BYTES)    //  32     r/o    -          Touch screen raw; msb16=x; lsb16=y (multitouch = touch 4)
++#define REG_TOUCH_SCREEN_XY           (REG_REGISTERS_BASE+0x110+REG_4_BYTES)    //  32     r/o    -          Touch 0
++#define REG_TOUCH_TAG_XY              (REG_REGISTERS_BASE+0x114+REG_4_BYTES)    //  32     r/o    -          Touch
++#define REG_TOUCH_TAG                 (REG_REGISTERS_BASE+0x118+REG_1_BYTE)    //   8     r/o    -           Touch tag results
++#define REG_CTOUCH_TRANSFORM_A        (REG_REGISTERS_BASE+0x11C+REG_4_BYTES)    //  32     r/w    0x00010000 Touch-screen transform coefficient (signed 15.16)
++#define REG_CTOUCH_TRANSFORM_B        (REG_REGISTERS_BASE+0x120+REG_4_BYTES)    //  32     r/w    0x00000000 Touch-screen transform coefficient
++#define REG_CTOUCH_TRANSFORM_C        (REG_REGISTERS_BASE+0x124+REG_4_BYTES)    //  32     r/w    0x00000000 Touch-screen transform coefficient
++#define REG_CTOUCH_TRANSFORM_D        (REG_REGISTERS_BASE+0x128+REG_4_BYTES)    //  32     r/w    0x00000000 Touch-screen transform coefficient
++#define REG_CTOUCH_TRANSFORM_E        (REG_REGISTERS_BASE+0x12C+REG_4_BYTES)    //  32     r/w    0x00010000 Touch-screen transform coefficient
++#define REG_CTOUCH_TRANSFORM_F        (REG_REGISTERS_BASE+0x130+REG_4_BYTES)    //  32     r/w    0x00000000 Touch-screen transform coefficient
++// Reserved                           (REG_REGISTERS_BASE+0x134)
++#define REG_CTOUCH_TOUCH4_X           (REG_REGISTERS_BASE+0x138+REG_2_BYTES)    //  16     r/o    -          Touch data for touch 4
++// Reserved                           (REG_REGISTERS_BASE+0x13C)
++// Reserved                           (REG_REGISTERS_BASE+0x140)
++// Reserved                           (REG_REGISTERS_BASE+0x144)
++// Reserved                           (REG_REGISTERS_BASE+0x148)
++// Reserved                           (REG_REGISTERS_BASE+0x14C)
++// Reserved                           (REG_REGISTERS_BASE+0x150)
++#define REG_SCREENSHOT_READ           (REG_REGISTERS_BASE+0x154+REG_1_BYTE)    //   1     r/w    0           Set to enable readout of screenshot
++// Reserved                           (REG_REGISTERS_BASE+0x158)
++// Reserved                           (REG_REGISTERS_BASE+0x15C)
++// Reserved                           (REG_REGISTERS_BASE+0x160)
++// Reserved                           (REG_REGISTERS_BASE+0x164)
++// Reserved                           (REG_REGISTERS_BASE+0x168)
++#define REG_TRIM                      (REG_REGISTERS_BASE+0x16C+REG_1_BYTE)    //   5     r/w    0           Internal relaxation clock trim
++// Reserved                           (REG_REGISTERS_BASE+0x170)
++#define REG_CTOUCH_DIRECT_XY          (REG_REGISTERS_BASE+0x174+REG_4_BYTES)    //  32     r/o    -
++#define REG_CTOUCH_DIRECT_Z           (REG_REGISTERS_BASE+0x178+REG_4_BYTES)    //  32     r/o    -
++#define REG_CTOUCH_TOUCH2_XY              REG_CTOUCH_DIRECT_Z
++
++#define REG_TRACKER                   0x109000
++#endif // __fb_ft801_h_included
+diff --git a/drivers/staging/fbtft/fb_ft81x.c b/drivers/staging/fbtft/fb_ft81x.c
+new file mode 100644
+index 0000000..67e3d1e
+--- /dev/null
++++ b/drivers/staging/fbtft/fb_ft81x.c
+@@ -0,0 +1,634 @@
++/*
++ * Custom FB driver for ft81x LCD controller
++ *
++ * Copyright (C) 2018 Gary Oliver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/gpio.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++
++#include <asm/irq.h>
++#include <asm/io.h>
++
++#include "fbtft.h"
++#include "fb_ft81x.h"
++
++#define DRVNAME			"fb_ft81x"
++#define WIDTH			480
++#define HEIGHT			272
++#define DEFAULT_BRIGHTNESS	50
++
++struct ft81x_extra {
++	struct input_dev	*input_dev;
++	char			phys_name[32];
++	int			window_xstart;
++	int			window_xend;
++	int			window_ystart;
++	int			window_yend;
++	int			irq;
++	u32			last_xyvalue;
++};
++
++#define PD_PIN			gpio.aux[0]
++#define INT_PIN			gpio.aux[1]
++
++/* A read function that knows how to handle register reads for ft81x
++ *
++ * Preload the buffer with the register address + a zero byte.
++ * Data is written and read on top of the source buffer.
++ */
++static int ft81x_read_register(struct fbtft_par *par, unsigned int address, u32 *value, size_t valsize)
++{
++	int ret;
++	u8 txbuf[32] = { 0, };
++	u8 rxbuf[32];
++
++	struct spi_transfer	t = {
++			.speed_hz	= 11000000,
++			.rx_buf		= rxbuf,
++			.tx_buf		= txbuf,
++			.len		= 8
++		};
++	struct spi_message	m;
++
++	if (!par->spi) {
++		dev_err(par->info->device,
++			"%s: par->spi is unexpectedly NULL\n", __func__);
++		return -ENODEV;
++	}
++
++	txbuf[0] = address >> 16;
++	txbuf[1] = address >> 8;
++	txbuf[2] = address >> 0;
++	txbuf[3] = 0;
++
++	spi_message_init(&m);
++	spi_message_add_tail(&t, &m);
++	ret = spi_sync(par->spi, &m);
++
++	switch (address & REG_LEN_MASK) {
++		case REG_8_BYTES:
++			memcpy(value, rxbuf+4, valsize);
++			break;
++		case REG_4_BYTES:
++			* value = (u32) rxbuf[7] << 24 | (u32) rxbuf[6] << 16 |
++				  (u32) rxbuf[5] << 8 | (u32) rxbuf[4];
++			break;
++		case REG_3_BYTES:
++			* value = (u32) rxbuf[6] << 16 | (u32) rxbuf[5] << 8 |
++				  (u32) rxbuf[4];
++			break;
++		case REG_2_BYTES:
++			* value = (u32) rxbuf[5] << 8 | (u32) rxbuf[4];
++			break;
++		case REG_1_BYTE:
++			* value = (u32) rxbuf[4];
++			break;
++		default:
++			break;
++	}
++
++	fbtft_par_dbg_hex(DEBUG_READ, par, par->info->device, u8, txbuf, t.len,
++		"%s(len=%d) OUT: ", __func__, t.len);
++
++	fbtft_par_dbg_hex(DEBUG_READ, par, par->info->device, u8, rxbuf, t.len,
++		"%s(len=%d) IN:  ", __func__, t.len);
++
++	return ret;
++}
++/*
++ * A write register that just writes the items as u8 bytes to device.
++ */
++static void ft81x_write_register(struct fbtft_par *par, int len, ...)
++{
++	va_list args;
++	int i, ret;
++	u8 *buf = (u8 *)par->buf;
++
++	/* Copy items to holding buffer */
++	va_start(args, len);
++	for (i = 0; i < len; i++) {
++		buf[i] = (u8) va_arg(args, unsigned int);
++	}
++	va_end(args);
++
++	/* Dump contents if debug enabled */
++	if (unlikely(par->debug & DEBUG_WRITE_REGISTER)) {
++		fbtft_par_dbg_hex(DEBUG_WRITE_REGISTER, par, par->info->device, u8, buf, len, "%s: ", __func__);
++	}
++
++	if (len) {
++		ret = par->fbtftops.write(par, buf, len * sizeof(u8));
++		if (ret < 0) {
++			va_end(args);
++			dev_err(par->info->device, "%s: write() failed and returned %d\n", __func__, ret);
++			return;
++		}
++	}
++}
++
++static void ft81x_write_8bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value);
++}
++
++static void ft81x_write_16bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8);
++}
++
++static void ft81x_write_24bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8, value >> 16);
++}
++
++static void ft81x_write_32bits(struct fbtft_par *par, unsigned address, unsigned int value)
++{
++	write_reg(par, (address >> 16) | 0x80, address >> 8, address >> 0, value, value >> 8, value >> 16, value >> 24);
++}
++
++#ifdef CONFIG_FB_BACKLIGHT
++static int ft81x_backlight_chip_update_status(struct backlight_device *bd)
++{
++	struct fbtft_par *par = bl_get_data(bd);
++	int brightness = bd->props.brightness;
++
++	fbtft_par_dbg(DEBUG_BACKLIGHT, par,
++		"%s: brightness=%d, power=%d, fb_blank=%d\n",
++		__func__, bd->props.brightness, bd->props.power,
++		bd->props.fb_blank);
++
++	if (bd->props.power != FB_BLANK_UNBLANK)
++		brightness = 0;
++
++	if (bd->props.fb_blank != FB_BLANK_UNBLANK)
++		brightness = 0;
++
++	ft81x_write_8bits(par, REG_PWM_DUTY, (brightness * 127) / 100);
++
++	return 0;
++}
++
++static const struct backlight_ops bl_ops = {
++	.update_status = ft81x_backlight_chip_update_status,
++};
++
++static void ft81x_register_chip_backlight(struct fbtft_par *par)
++{
++	struct backlight_device *bd;
++	struct backlight_properties bl_props = { 0, };
++
++	bl_props.type = BACKLIGHT_RAW;
++	bl_props.power = FB_BLANK_POWERDOWN;
++	bl_props.max_brightness = 100;
++	bl_props.brightness = DEFAULT_BRIGHTNESS;
++
++	bd = backlight_device_register(dev_driver_string(par->info->device),
++				par->info->device, par, &bl_ops, &bl_props);
++	if (IS_ERR(bd)) {
++		dev_err(par->info->device,
++			"cannot register backlight device (%ld)\n",
++			PTR_ERR(bd));
++		return;
++	}
++	par->info->bl_dev = bd;
++
++	if (!par->fbtftops.unregister_backlight)
++		par->fbtftops.unregister_backlight = fbtft_unregister_backlight;
++}
++#else
++#define ft81x_register_chip_backlight NULL
++#endif
++
++static void wait_display_list_available(struct fbtft_par *par)
++{
++	uint32_t dlswap;
++	do {
++		ft81x_read_register(par, REG_DLSWAP, &dlswap, sizeof(dlswap));
++		if (dlswap != 0) {
++			fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s(**************************** waiting for dlswap *************************)", __func__);
++			udelay(100);
++		}
++	} while (dlswap != 0);
++}
++
++int ft81x_write_vmem(struct fbtft_par *par, size_t offset, size_t len)
++{
++	u16 *vmem;
++	size_t remain;
++	int ret = 0;
++	u32 address = RAM_G + offset;
++
++	fbtft_par_dbg(DEBUG_WRITE_VMEM, par, "%s(offset=%zu, len=%zu)\n",
++		__func__, offset, len);
++
++	remain = len / 2; /* Number of pixels remaining */
++	vmem = (u16 *)(par->info->screen_buffer + offset);
++
++	wait_display_list_available(par);
++
++	if (!par->txbuf.buf) {
++		/* Non buffered write */
++		ret = par->fbtftops.write(par, vmem, len);
++	} else {
++		/* buffered write - allow room for address header (3 bytes) */
++		size_t tx_array_size = (par->txbuf.len - 3) / 2;
++
++		while (remain && ret >= 0) {
++			u8* txptr = par->txbuf.buf;
++			int i;
++			size_t to_copy = min(tx_array_size, remain);
++
++			dev_dbg(par->info->device, "    to_copy=%zu, remain=%zu\n",
++							to_copy, remain - to_copy);
++
++			/* Load the address */
++			*txptr++ = (u8) (address >> 16) | 0x80;
++			*txptr++ = (u8) (address >> 8);
++			*txptr++ = (u8) (address >> 0);
++
++			for (i = 0; i < to_copy; i++) {
++				u16 pixel = cpu_to_be16(vmem[i]);
++				*txptr++ = (u8) (pixel >> 8);
++				*txptr++ = (u8) (pixel >> 0);
++			}
++
++			ret = par->fbtftops.write(par, par->txbuf.buf, (txptr - (u8*) par->txbuf.buf));
++
++			vmem = vmem + to_copy;
++			remain -= to_copy;
++			address += to_copy * 2;
++		}
++	}
++
++	return ret;
++}
++
++static void ft81x_set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
++{
++	/* Remember this boundary */
++	struct ft81x_extra *extra = (struct ft81x_extra*) (par->extra);
++	extra->window_xstart = xs;
++	extra->window_ystart = ys;
++	extra->window_xend = xe;
++	extra->window_yend = ye;
++
++	fbtft_par_dbg(DEBUG_SET_ADDR_WIN, par,
++		"%s(xs=%d, ys=%d, xe=%d, ye=%d)\n", __func__, xs, ys, xe, ye);
++}
++
++static int ft81x_set_var(struct fbtft_par *par)
++{
++	fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s()\n", __func__);
++
++	switch (par->info->var.rotate) {
++	case 270:
++		ft81x_write_8bits(par, REG_ROTATE, ROTATE_270);
++		break;
++	case 180:
++		ft81x_write_8bits(par, REG_ROTATE, ROTATE_180);
++		break;
++	case 90:
++		ft81x_write_8bits(par, REG_ROTATE, ROTATE_90);
++		break;
++	default:
++		ft81x_write_8bits(par, REG_ROTATE, ROTATE_0);
++		break;
++	}
++
++	return 0;
++}
++
++static unsigned long
++ft81x_request_gpios_match(struct fbtft_par *par, const struct fbtft_gpio *gpio)
++{
++	dev_dbg(par->info->device,
++		"%s('%s')\n", __func__, gpio->name);
++
++	if (strcasecmp(gpio->name, "pd") == 0) {
++		/* Powerdown pin */
++		par->PD_PIN = gpio->gpio;
++		return GPIOF_OUT_INIT_HIGH;
++	} else if (strcasecmp(gpio->name, "int") == 0) {
++		/* Interrupt input pin */
++		par->INT_PIN = gpio->gpio;
++		return GPIOF_IN;
++	}
++
++	return FBTFT_GPIO_NO_MATCH;
++}
++
++static irqreturn_t ft81x_interrupt(int irq, void *param)
++{
++	struct fbtft_par *par = (struct fbtft_par*) param;
++	struct ft81x_extra *extra = (struct ft81x_extra *) (par->extra);
++
++	u32 flags;
++	u32 xyvalue;
++	u32 mask;
++
++	/* Read to make interrupt go away */
++	ft81x_read_register(par, REG_INT_FLAGS, &flags, sizeof(flags));
++
++	// if (flags == 0)
++	//	return IRQ_NONE;
++
++	if ((flags & INT_MASK_TOUCH) != 0) {
++		/* Touch detected - turn on reading of raw touch until no touch detected */
++		//ft81x_read_register(par, REG_INT_MASK, &mask, sizeof(mask));
++		ft81x_write_8bits(par, REG_INT_MASK, /* mask | */ INT_MASK_CONVCOMPLETE);
++	} else if ((flags & INT_MASK_CONVCOMPLETE) != 0) {
++		/* Read XY value */
++		ft81x_read_register(par, REG_TOUCH_RAW_XY, &xyvalue, sizeof(xyvalue));
++
++		if (xyvalue != extra->last_xyvalue) {
++			extra->last_xyvalue = xyvalue;
++
++			fbtft_par_dbg(DEBUG_MKDIRTY, par,
++				"%s(X=%d Y=%d)\n", __func__, (xyvalue>>16), (xyvalue&0xFFFF));
++
++			if (xyvalue != 0xFFFFFFFF) {
++				input_report_abs(extra->input_dev, ABS_X, (xyvalue >> 16) & 0xFFFF);
++				input_report_abs(extra->input_dev, ABS_Y, (xyvalue & 0xFFFF));
++				input_report_key(extra->input_dev, BTN_TOUCH, 1);
++			} else {
++				input_report_key(extra->input_dev, BTN_TOUCH, 0);
++			}
++			input_sync(extra->input_dev);
++		}
++
++		if (xyvalue == 0xFFFFFFFF) {
++			/* Turn off conv and wait for next touch */
++			// ft81x_read_register(par, REG_INT_MASK, &mask, sizeof(mask));
++			ft81x_write_8bits(par, REG_INT_MASK, /* mask & ~INT_MASK_CONVCOMPLETE */ INT_MASK_TOUCH);
++		}
++	} else {
++		static int intcount;
++
++		if (++intcount > 1000) {
++			intcount = 0;
++			ft81x_read_register(par, REG_INT_MASK, &mask, sizeof(mask));
++			fbtft_par_dbg(DEBUG_MKDIRTY, par,
++				      "%s(no flags of interest: mask=%02x flags=%02x)\n",
++				      __func__, mask, flags);
++		}
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int ft81x_init_input_driver(struct fbtft_par *par)
++{
++	int error;
++	u32 flag;
++	struct ft81x_extra *extra = (struct ft81x_extra*) (par->extra);
++
++	extra->irq = gpio_to_irq(par->INT_PIN);
++	if (extra->irq < 0) {
++		printk(KERN_ERR "fb_ft81x.c: Can't allocate irq %d\n",
++		       par->INT_PIN);
++		error = -EBUSY;
++		goto err_free_extra;
++	}
++
++	fbtft_par_dbg(DEBUG_INIT_DISPLAY, par,
++		"%s(gpio %d assigned irq %d)",
++		__func__, par->INT_PIN, extra->irq);
++
++	error = request_threaded_irq(extra->irq,
++				     NULL, ft81x_interrupt,
++				     /* IRQF_SHARED | */
++					 IRQF_TRIGGER_FALLING |
++					 IRQF_ONESHOT,
++				     "ft81x_int", par);
++
++	if (error) {
++		printk(KERN_ERR "fb_ft81x.c: Can't allocate handler: %d\n",
++		       error);
++		goto err_free_extra;
++	}
++
++	extra->input_dev = input_allocate_device();
++	if (!extra->input_dev) {
++		printk(KERN_ERR "fb_ft81x.c: Not enough memory\n");
++		error = -ENOMEM;
++		goto err_free_irq;
++	}
++
++	snprintf(extra->phys_name, sizeof(extra->phys_name), "%s/input0", dev_name(par->info->device));
++	extra->input_dev->name = "FT81x touchscreen";
++	extra->input_dev->phys = extra->phys_name;
++//	extra->input_dev->dev.parent = &spi->dev;
++
++	set_bit(EV_ABS, extra->input_dev->evbit);
++	set_bit(ABS_X, extra->input_dev->absbit);
++	set_bit(ABS_Y, extra->input_dev->absbit);
++
++	set_bit(EV_KEY, extra->input_dev->evbit);
++	set_bit(BTN_TOUCH, extra->input_dev->keybit);
++
++	input_set_abs_params(extra->input_dev, ABS_X, 0, WIDTH, 0, 0);
++	input_set_abs_params(extra->input_dev, ABS_Y, 0, HEIGHT, 0, 0);
++
++	error = input_register_device(extra->input_dev);
++	if (error) {
++		printk(KERN_ERR "fb_ft81x.c: Failed to register device: %d\n",
++		       error);
++		goto err_free_dev;
++	}
++
++	/* Enable touch mode */
++	ft81x_write_8bits(par, REG_CTOUCH_MODE, CTOUCH_MODE_CONTINUOUS);
++
++	/* Enable the interrupt and wait for a touch */
++	ft81x_write_8bits(par, REG_INT_MASK, INT_MASK_TOUCH);
++	ft81x_write_8bits(par, REG_INT_EN, 1);
++
++	return 0;
++
++ err_free_dev:
++	input_free_device(extra->input_dev);
++ err_free_irq:
++	free_irq(extra->irq, par);
++ err_free_extra:
++	kfree(extra);
++	par->extra = NULL;
++
++	return error;
++}
++
++static int ft81x_deinit_input_driver(struct fbtft_par *par)
++{
++	u32 flag;
++	struct ft81x_extra *extra = (struct ft81x_extra *)(par->extra);
++
++	ft81x_write_8bits(par, REG_INT_EN, 0);
++	ft81x_write_8bits(par, REG_INT_MASK, 0);
++
++	input_unregister_device(extra->input_dev);
++
++	free_irq(extra->irq, par);
++
++	ft81x_write_8bits(par, REG_CTOUCH_MODE, CTOUCH_MODE_OFF);
++
++	kfree(extra);
++	par->extra = NULL;
++
++	return 0;
++}
++
++static int ft81x_init_display(struct fbtft_par *par)
++{
++	int ret;
++
++	fbtft_par_dbg(DEBUG_INIT_DISPLAY, par, "%s()\n", __func__);
++
++	par->fbtftops.reset(par);
++
++	/* Allocate some extra info for this device */
++	par->extra = (void*) kzalloc(sizeof(struct ft81x_extra), GFP_KERNEL);
++	if (par->extra == NULL)
++		return -ENOMEM;
++
++	/* Send reset */
++	write_reg(par, CMD_CORERST, 0, 0);
++	mdelay(300);
++	write_reg(par, CMD_CLKEXT, 0, 0);    // External clock
++	write_reg(par, CMD_ACTIVE, 0, 0);
++	mdelay(300);
++
++	/* Change INT_N to pull up/down */
++//	uint32_t gpiox;
++//	ft81x_read_register(par, REG_GPIOX, &gpiox, sizeof(gpiox));
++//	ft81x_write_16(par, REG_GPIOX, gpiox | GPIOX_INT_N);
++
++	ft81x_write_16bits(par, REG_HCYCLE, 548);
++	ft81x_write_16bits(par, REG_HOFFSET, 43);
++	ft81x_write_16bits(par, REG_HSYNC0, 0);
++	ft81x_write_16bits(par, REG_HSYNC1, 41);
++	ft81x_write_16bits(par, REG_VCYCLE, 292);
++	ft81x_write_16bits(par, REG_VOFFSET, 12);
++	ft81x_write_16bits(par, REG_VSYNC0, 0);
++	ft81x_write_16bits(par, REG_VSYNC1, 10);
++	ft81x_write_8bits(par, REG_SWIZZLE, 0);
++	ft81x_write_8bits(par, REG_PCLK_POL, 1);
++	ft81x_write_8bits(par, REG_CSPREAD, 1);
++	ft81x_write_8bits(par, REG_DITHER, 1);
++	ft81x_write_16bits(par, REG_HSIZE, WIDTH);
++	ft81x_write_16bits(par, REG_VSIZE, HEIGHT);
++
++	wait_display_list_available(par);
++
++	START_RAM_DL(10, RAM_DL)
++		WRITE_RAM_DL(RAM_DL_CLEAR_COLOR_RGB(0,0,0));
++		WRITE_RAM_DL(RAM_DL_CLEAR(CLEAR_COLOR_BUFFER | CLEAR_STENCIL_BUFFER | CLEAR_TAG_BUFFER));
++		WRITE_RAM_DL(RAM_DL_BITMAP_SOURCE(RAM_G));
++		WRITE_RAM_DL(RAM_DL_BITMAP_LAYOUT(BITMAP_LAYOUT_RGB565, 2*WIDTH, HEIGHT));
++		WRITE_RAM_DL(RAM_DL_BITMAP_SIZE(BITMAP_SIZE_NEAREST, BITMAP_SIZE_BORDER, BITMAP_SIZE_BORDER, WIDTH, HEIGHT));
++		WRITE_RAM_DL(RAM_DL_BEGIN(BEGIN_BITMAPS));
++		WRITE_RAM_DL(RAM_DL_VERTEX2II(0, 0, 0, 0));
++		WRITE_RAM_DL(RAM_DL_END());
++		WRITE_RAM_DL(RAM_DL_DISPLAY());
++	ret = END_RAM_DL(par);
++
++	if (ret == 0) {
++		u32 gpio;
++		u32 id;
++		u32 frequency;
++
++		ft81x_write_8bits(par, REG_DLSWAP, DLSWAP_FRAME);
++
++		/* Enable display */
++		ft81x_read_register(par, REG_GPIO_DIR, &gpio, sizeof(gpio));
++		gpio |= 0x80;
++		ft81x_write_8bits(par, REG_GPIO_DIR, gpio);
++		ft81x_read_register(par, REG_GPIO, &gpio, sizeof(gpio));
++		gpio |= 0x80;
++		ft81x_write_8bits(par, REG_GPIO, gpio);
++
++		ft81x_write_8bits(par, REG_PCLK, 5);
++
++		ft81x_read_register(par, REG_ID, &id, sizeof(id));
++		ft81x_read_register(par, REG_FREQUENCY, &frequency, sizeof(frequency));
++		ft81x_read_register(par, REG_GPIO, &gpio, sizeof(gpio));
++
++		fbtft_par_dbg(DEBUG_INIT_DISPLAY, par,
++			"%s(id=%x, frequency=%d, gpio=%x)\n", __func__, id, frequency, gpio);
++
++	} else {
++		dev_err(par->info->device,
++			"%s: failure to write ramdl\n", __func__);
++	}
++
++	if (ret == 0) {
++		ret = ft81x_init_input_driver(par);
++	}
++	return ret;
++}
++
++static int ft81x_deinit_display(struct fbtft_par *par)
++{
++	int ret;
++
++	ft81x_deinit_input_driver(par);
++
++	/* Clear screen */
++	START_RAM_DL(4, RAM_DL)
++		WRITE_RAM_DL(RAM_DL_CLEAR_COLOR_RGB(0,0,0));
++		WRITE_RAM_DL(RAM_DL_CLEAR(CLEAR_COLOR_BUFFER | CLEAR_STENCIL_BUFFER | CLEAR_TAG_BUFFER));
++		WRITE_RAM_DL(RAM_DL_DISPLAY());
++
++	ret = END_RAM_DL(par);
++
++	if (ret == 0) {
++		ft81x_write_8bits(par, REG_DLSWAP, DLSWAP_FRAME);
++	}
++
++	return ret;
++}
++
++static struct fbtft_display display = {
++	.regwidth = 8,
++	.txbuflen = 65536,
++	.width    = WIDTH,
++	.height   = HEIGHT,
++	.fbtftops = {
++		.init_display        = ft81x_init_display,
++		.deinit_display      = ft81x_deinit_display,
++		.set_addr_win        = ft81x_set_addr_win,
++		.write_register      = ft81x_write_register,
++		.write_vmem          = ft81x_write_vmem,
++		.set_var             = ft81x_set_var,
++		.register_backlight  = ft81x_register_chip_backlight,
++		.request_gpios_match = ft81x_request_gpios_match,
++	},
++};
++
++FBTFT_REGISTER_DRIVER(DRVNAME, "ftdi,ft81x", &display);
++
++MODULE_ALIAS("spi:" DRVNAME);
++MODULE_ALIAS("spi:ft81x");
++
++MODULE_DESCRIPTION("Custom FB driver for ft81x display");
++MODULE_AUTHOR("Gary Oliver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/staging/fbtft/fb_ft81x.h b/drivers/staging/fbtft/fb_ft81x.h
+new file mode 100644
+index 0000000..00bc016
+--- /dev/null
++++ b/drivers/staging/fbtft/fb_ft81x.h
+@@ -0,0 +1,420 @@
++/*
++ * fb_ft81x.h
++ *
++ * Defines for ft81x device
++ */
++#ifndef __fb_ft81x_h_included
++#define __fb_ft81x_h_included
++
++/*
++ * Commands
++ *
++ * These are one-byte commands with two bytes of (user supplied) 0 after the first byte.
++ */
++
++#define CMD_ACTIVE                    0x00                          // Enter active mode
++#define CMD_STANDBY                   0x41                          // Enter standby mode (default)
++#define CMD_SLEEP                     0x42                          // Enter sleep mode
++#define CMD_PWRDOWN                   0x50                          // Enter power down mode
++#define CMD_PD_ROMS                   0x49                          // Power down roms
++#define  PD_ROMS_MAIN         0x80
++#define  PD_ROMS_RCOSATAN     0x40
++#define  PD_ROMS_SAMPLE       0x20
++#define  PD_ROMS_JABOOT       0x10
++#define  PD_ROMS_J1BOOT       0x08
++// reserved                   0x07
++#define CMD_CLKEXT                    0x44                          // Use external clock
++#define CMD_CLKINT                    0x48                          // Use internal clock
++#define CMD_CLKSEL                    0x62
++#define  CLKSEL_DEFAULT       0x00
++// reserved                   0x01
++#define  CLKSEL_2x            0x02
++#define  CLKSEL_3x            0x43
++#define  CLKSEL_4x            0x04
++#define  CLKSEL_5x            0x45
++#define CMD_CORERST                   0x68                          // Core reset
++#define CMD_PINDRIVE                  0x70                          // Set PIN drive
++#define  PINDRIVE_5mA         0x00
++#define  PINDRIVE_10mA        0x01
++#define  PINDRIVE_14mA        0x02
++#define  PINDRIVE_20mA        0x03
++#define  PINDRIVE_GPIO0       (0*0x04)
++#define  PINDRIVE_GPIO1       (1*0x04)
++#define  PINDRIVE_GPIO2       (2*0x04)
++#define  PINDRIVE_GPIO3       (3*0x04)
++// reserved                   (4*0x04) to (7*0x04)
++#define  PINDRIVE_DISP        (8*0x04)
++#define  PINDRIVE_DE          (9*0x04)
++#define  PINDRIVE_xSYNC       (10*0x04)
++#define  PINDRIVE_PCLK        (11*0x04)
++#define  PINDRIVE_BACKLIGHT   (12*0x04)
++#define  PINDRIVE_RGB         (13*0x04)
++#define  PINDRIVE_AUDIO_L     (14*0x04)
++#define  PINDRIVE_INT_N       (15*0x04)
++#define  PINDRIVE_CTP_RST_N   (16*0x04)
++#define  PINDRIVE_CTP_SCL     (17*0x04)
++#define  PINDRIVE_CTP_SDA     (18*0x04)
++#define  PINDRIVE_SPI         (19*0x04)
++// reserved                   (20*0x04) to (31*0x04)
++#define CMD_PIN_PD_STATE      0x71
++#define  PIN_PD_STATE_FLOAT   0
++#define  PIN_PD_STATE_PULLDN  1
++#define  PIN_PD_STATE_PULLUP  2
++// reserved                   3
++
++
++#define RAM_G                         0x00000000 // - 0x0FFFFF
++#define ROM_FONT                      0x001E0000 // - 0x2FFFFB
++#define ROM_FONT_ADDR                 0x002FFFFC // - 0x2FFFFF
++#define RAM_DL                        0x00300000 // - 0x301FFF
++#define REG_REGISTERS_BASE            0x00302000 // - 0x302FFF
++#define RAM_CMD                       0x00308000 // - 0x308FFF
++
++#define REG_1_BYTE                    0x01000000 // - one byte value
++#define REG_2_BYTES                   0x02000000 // - two byte value
++#define REG_3_BYTES                   0x03000000 // - three byte value
++#define REG_4_BYTES                   0x04000000 // - four byte value
++#define REG_8_BYTES                   0x08000000 // - eight byte value
++#define REG_LEN_MASK                  0x0F000000 // mask for length field
++#define REG_ADDR_MASK                 0x003FFFFF // mask for address field
++#define REG_ADDR_MASK                 0x003FFFFF // mask for address field
++
++/*
++ * RAM_DL commands:
++ */
++#define START_RAM_DL(size, addr) { u8 __ramdlbuf__[((size)*4)+3]; size_t index = 3; int __out_of_room__ = 0; \
++					__ramdlbuf__[0] = (((addr) >> 16) & 0xFF) | 0x80; \
++					__ramdlbuf__[1] = ((addr) >> 8) & 0xFF; \
++					__ramdlbuf__[2] = ((addr) >> 0) & 0xFF; \
++
++#define WRITE_RAM_DL(f) \
++		if (index <= sizeof(__ramdlbuf__) - 3) { \
++			__ramdlbuf__[index+0] = ((f)>>0) & 0xFF; \
++			__ramdlbuf__[index+1] = ((f)>>8) & 0xFF; \
++			__ramdlbuf__[index+2] = ((f)>>16) & 0xFF; \
++			__ramdlbuf__[index+3] = ((f)>>24) & 0xFF; \
++			index += 4; \
++		} else { \
++			__out_of_room__=-99; \
++		}
++
++#define END_RAM_DL(par) (__out_of_room__ || par->fbtftops.write(par, __ramdlbuf__, index)); }
++
++#define RAM_DL_DISPLAY()			((0x00<<24))
++
++#define RAM_DL_BITMAP_SOURCE(addr)	((0x01<<24) | ((addr)<<0))
++
++#define RAM_DL_CLEAR_COLOR_RGB(r,g,b)	((0x02<<24) | ((r)<<16) | ((b)<<8) | ((g)<<0))
++
++#define RAM_DL_TAG(s)			((0x03<<24) | ((s)<<0))
++
++#define RAM_DL_COLOR_RGB(r,g,b)		((0x04<<24) | ((r)<<16) | ((b)<<8) | ((g)<<0))
++
++#define RAM_DL_BITMAP_HANDLE(handle)	((0x05<<24) | ((handle)<<0))
++
++#define RAM_DL_CELL(cell)		((0x06<<24) | ((cell)<<0))
++
++#define RAM_DL_BITMAP_LAYOUT(f, s, h)	((0x07<<24) | ((f)<<19) | ((s)<<9) | ((h)<<0))
++#define BITMAP_LAYOUT_ARGB1555		0
++#define BITMAP_LAYOUT_L1		1
++#define BITMAP_LAYOUT_L4		2
++#define BITMAP_LAYOUT_L8		3
++#define BITMAP_LAYOUT_RGB332		4
++#define BITMAP_LAYOUT_ARGB2		5
++#define BITMAP_LAYOUT_ARGB4		6
++#define BITMAP_LAYOUT_RGB565		7
++#define BITMAP_LAYOUT_PALETTED		8
++#define BITMAP_LAYOUT_TEXT8X8		9
++#define BITMAP_LAYOUT_TEXTVGA		10
++#define BITMAP_LAYOUT_BARGRAPH		11
++
++#define RAM_DL_BITMAP_SIZE(f, wrx, wry, w, h)	((0x08<<24) | ((f)<<20) | ((wrx)<<19) | ((wry)<<18) | ((w)<<9) | ((h)<<0))
++#define BITMAP_SIZE_NEAREST		0
++#define BITMAP_SIZE_BILINEAR		1
++#define BITMAP_SIZE_BORDER		0
++#define BITMAP_SIZE_REPEAT		1
++
++#define RAM_DL_ALPH_FUNC(func, ref)	((0x09<<24) | ((func)<<8) | ((ref)<<0))
++#define ALPHA_FUNC_NEVER		0
++#define ALPHA_FUNC_LESS			1
++#define ALPHA_FUNC_LEQUAL		2
++#define ALPHA_FUNC_GREATER		3
++#define ALPHA_FUNC_GEQUAL		4
++#define ALPHA_FUNC_EQUAL		5
++#define ALPHA_FUNC_NOTEQUAL		6
++#define ALPHA_FUNC_ALWAYS		7
++
++#define RAM_DL_STENCIL_FUNC(func,ref,mask)	((0x0A<<24) | ((func)<<16) | ((ref)<<8) | ((mask)<<0))
++#define STENCIL_FUNC_NEVER		0
++#define STENCIL_FUNC_LESS		1
++#define STENCIL_FUNC_LEQUAL		2
++#define STENCIL_FUNC_GREATER		3
++#define STENCIL_FUNC_GEQUAL		4
++#define STENCIL_FUNC_EQUAL		5
++#define STENCIL_FUNC_NOTEQUAL		6
++#define STENCIL_FUNC_ALWAYS		7
++
++#define RAM_DL_BLEND_FUNC(src, dst)	((0x0B<<24) | ((src)<<3) | ((dst)<<0))
++#define BLEND_FUNC_ZERO			0
++#define BLEND_FUNC_ONE			1
++#define BLEND_FUNC_SRC_ALPHA		2
++#define BLEND_FUNC_DST_ALPHA		3
++#define BLEND_FUNC_ONE_MINUS_SRC_ALPHA	4
++#define BLEND_FUNC_ONE_MINUS_DST_ALPHA	5
++
++#define RAM_DL_STENCIL_OP(fail,pass)	((0x0C<<24) | ((fail)<<3) | ((pass)<<0))
++#define STENCIL_OP_ZERO			0
++#define STENCIL_OP_KEEP			1
++#define STENCIL_OP_REPLACE		2
++#define STENCIL_OP_INCR			3
++#define STENCIL_OP_DECR			4
++#define STENCIL_OP_INVERT		5
++
++#define RAM_DL_POINT_SIZE(s)		((0x0D<<24) | ((s)<<0))
++
++#define RAM_DL_LINE_WIDTH(w)		((0x0E<<24) | ((w)<<0))
++
++#define RAM_DL_CLEAR_COLOR_A(alpha)	((0x0F<<24) | ((alpha)<<0))
++
++#define RAM_DL_COLOR_A(alpha)		((0x10<<24) | ((alpha)<<0))
++
++#define RAM_DL_CLEAR_STENCIL(s)		((0x11<<24) | ((s)<<0))
++
++#define RAM_DL_CLEAR_TAG(t)		((0x12<<24) | ((t)<<0))
++
++#define RAM_DL_STENCIL_MASK(m)		((0x13<<24) | ((m)<<0))
++
++#define RAM_DL_TAG_MASK(m)		((0x14<<24) | ((m)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_A(a)	((0x15<<24) | ((a)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_B(b)	((0x16<<24) | ((b)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_C(c)	((0x17<<24) | ((c)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_D(d)	((0x18<<24) | ((d)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_E(e)	((0x19<<24) | ((e)<<0))
++
++#define RAM_DL_BITMAP_TRANSFORM_F(f)	((0x1A<<24) | ((f)<<0))
++
++#define RAM_DL_SCISSOR_XY(x, y)		((0x1B<<24) | ((x)<<11) | ((y)<<0))
++
++#define RAM_DL_SCISSOR_SIZE(w,h)	((0x1C<<24) | ((w)<<12) | ((h)<<0))
++
++#define RAM_DL_CALL(addr)		((0x1D<<24) | ((addr)<<0))
++
++#define RAM_DL_JUMP(dest)		((0x1E<<24) | ((dest)<<0))
++
++#define RAM_DL_BEGIN(prim)		((0x1F<<24) | ((prim)<<0))
++#define BEGIN_BITMAPS			1
++#define BEGIN_POINTS			2
++#define BEGIN_LINES			3
++#define BEGIN_LINE_STRIP		4
++#define BEGIN_EDGE_STRIP_R		5
++#define BEGIN_EDGE_STRIP_L		6
++#define BEGIN_EDGE_STRIP_A		7
++#define BEGIN_EDGE_STRIP_B		8
++#define BEGIN_RECTS			9
++
++#define RAM_DL_COLOR_MASK(color)	((0x20<<24) | ((color)<<0))
++#define COLOR_MASK_R			0x08
++#define COLOR_MASK_G			0x04
++#define COLOR_MASK_B			0x02
++#define COLOR_MASK_A			0x01
++
++#define RAM_DL_END()			((0x21<<24))
++
++#define RAM_DL_SAVE_CONTEXT()		((0x22<<24))
++
++#define RAM_DL_RESTORE_CONTEXT()		((0x23<<24))
++
++#define RAM_DL_RETURN()			((0x24<<24))
++
++#define RAM_DL_MACRO(n)			((0x25<<24) | ((n)<<0))
++
++#define RAM_DL_CLEAR(flags)		((0x26<<24) | ((flags)<<0))
++#define CLEAR_COLOR_BUFFER		0x04
++#define CLEAR_STENCIL_BUFFER		0x02
++#define CLEAR_TAG_BUFFER		0x01
++
++#define RAM_DL_VERTEX_FORMAT(f)		((0x27<<24) | ((f)<<0))
++
++#define RAM_DL_BITMAP_LAYOUT_H(s,h)	((0x28<<24) | ((s)<<2) | ((h)<<0))
++
++#define RAM_DL_BITMAP_SIZE_H(w,h)	((0x29<<24) | ((w)<<2) | ((h)<<0))
++
++#define RAM_DL_PALETTE_SOURCE(r,a)	((0x2A<<24) | ((r)<<22) | ((a)<<0))
++
++#define RAM_DL_VERTEX_TRANSLATE_X(x)	((0x2B<<24) | ((x)<<0))
++
++#define RAM_DL_VERTEX_TRANSLATE_Y(y)	((0x2C<<24) | ((y)<<0))
++
++#define RAM_DL_VERTEX2F(x,y)		((0x1<<30) | ((x)<<15) | ((y)<<0))
++
++#define RAM_DL_VERTEX2II(x,y,h,c)	((0x2<<30) | ((x)<<21) | ((y)<<12) | ((h)<<7) | ((c)<<0))
++
++
++
++//      Name                          Offset                                   // Bits  Access  Reset Value  Description
++#define REG_ID                        (REG_REGISTERS_BASE+0x000+REG_1_BYTE)    //   8     r/o    0x7C        ID register
++#define REG_FRAMES                    (REG_REGISTERS_BASE+0x004+REG_4_BYTES)   //  32     r/o    0x00000000  Frame counter since reset
++#define REG_CLOCK                     (REG_REGISTERS_BASE+0x008+REG_4_BYTES)   //  32     r/o    0x00000000  Clock cycles since reset
++#define REG_FREQUENCY                 (REG_REGISTERS_BASE+0x00C+REG_4_BYTES)   //  28     r/w    60000000    Main clock frequency
++#define REG_RENDERMODE                (REG_REGISTERS_BASE+0x010+REG_1_BYTE)    //   8     r/w    0           normal=0 singleline=1
++#define REG_SNAPPY                    (REG_REGISTERS_BASE+0x014+REG_2_BYTES)   //  11     r/w    0           Scanline select for rendermode=1
++#define REG_SNAPSHOT                  (REG_REGISTERS_BASE+0x018+REG_1_BYTE)    //   1     r/w    -           Trigger for rendermode 1
++#define REG_SNAPSHOTFORMAT            (REG_REGISTERS_BASE+0x01C+REG_1_BYTE)    //   6     r/w    0x20        Pixel format for scanline readout
++#define REG_CPURESET                  (REG_REGISTERS_BASE+0x020+REG_1_BYTE)    //   3     r/w    2           Graphics, audio and touch reset control
++#define REG_TAP_CRC                   (REG_REGISTERS_BASE+0x024+REG_4_BYTES)   //  32     r/o    -           Live video tap crc; computed every DL_SWAP
++#define REG_TAP_MASK                  (REG_REGISTERS_BASE+0x028+REG_4_BYTES)   //  32     r/o    0xFFFFFFFF  Live video tap mask
++#define REG_HCYCLE                    (REG_REGISTERS_BASE+0x02C+REG_2_BYTES)   //  12     r/w    0x224 (548) Horizontal total cycle count
++#define REG_HOFFSET                   (REG_REGISTERS_BASE+0x030+REG_2_BYTES)   //  12     r/w    0x2B  (43)  Horizontal display start offset
++#define REG_HSIZE                     (REG_REGISTERS_BASE+0x034+REG_2_BYTES)   //  12     r/w    0x1E0 (480) Horizontal display pixel count
++#define REG_HSYNC0                    (REG_REGISTERS_BASE+0x038+REG_2_BYTES)   //  12     r/w    0x000 (0)   Horizontal sync fall offset
++#define REG_HSYNC1                    (REG_REGISTERS_BASE+0x03C+REG_2_BYTES)   //  12     r/w    0x029 (41)  Horizontal sync rise offset
++#define REG_VCYCLE                    (REG_REGISTERS_BASE+0x040+REG_2_BYTES)   //  12     r/w    0x124 (292) Vertical total cycle count
++#define REG_VOFFSET                   (REG_REGISTERS_BASE+0x044+REG_2_BYTES)   //  12     r/w    0x00C (12)  Vertical display start offset
++#define REG_VSIZE                     (REG_REGISTERS_BASE+0x048+REG_2_BYTES)   //  12     r/w    0x110 (272) Vertical display line count
++#define REG_VSYNC0                    (REG_REGISTERS_BASE+0x04C+REG_2_BYTES)   //  12     r/w    0x000 (0)   Vertical sync fall offset
++#define REG_VSYNC1                    (REG_REGISTERS_BASE+0x050+REG_2_BYTES)   //  12     r/w    0x00A (10)  Vertical sync rise offset
++#define REG_DLSWAP                    (REG_REGISTERS_BASE+0x054+REG_1_BYTE)    //   2     r/w    0           Display list swap control
++#define DLSWAP_LINE	0x01	/* Swap at next line */
++#define DLSWAP_FRAME	0x02	/* Swap at next frame */
++#define REG_ROTATE                    (REG_REGISTERS_BASE+0x058+REG_1_BYTE)    //   1     r/w    0           Set to rotate screen 180 degrees
++#define  ROTATE_0	0
++#define  ROTATE_90	3
++#define  ROTATE_180	1
++#define  ROTATE_270	2
++#define REG_OUTBITS                   (REG_REGISTERS_BASE+0x05C+REG_2_BYTES)   //   9     r/w    0x1B6       Output bit resolution (3x3x3)
++#define REG_DITHER                    (REG_REGISTERS_BASE+0x060+REG_1_BYTE)    //   1     r/w    0           Set to enable dither
++#define REG_SWIZZLE                   (REG_REGISTERS_BASE+0x064+REG_1_BYTE)    //   4     r/w    0x0         Output RGB signal swizzle
++#define REG_CSPREAD                   (REG_REGISTERS_BASE+0x068+REG_1_BYTE)    //   1     r/w    1           Output clock spreading enable
++#define REG_PCLK_POL                  (REG_REGISTERS_BASE+0x06C+REG_1_BYTE)    //   1     r/w    0           PCLK polarity;0 PCLK rising; 1 PCLK falling
++#define REG_PCLK                      (REG_REGISTERS_BASE+0x070+REG_1_BYTE)    //   8     r/w    0x00        PCLK frequency divider, 0 = disable
++#define REG_TAG_X                     (REG_REGISTERS_BASE+0x074+REG_2_BYTES)   //   9     r/w    0x000       Tag query X coordinate
++#define REG_TAG_Y                     (REG_REGISTERS_BASE+0x078+REG_2_BYTES)   //   9     r/w    0x000       Tag query Y coordinate
++#define REG_TAG                       (REG_REGISTERS_BASE+0x07C+REG_1_BYTE)    //   8     r/o    0x00        Tag query result
++#define REG_VOL_PB                    (REG_REGISTERS_BASE+0x080+REG_1_BYTE)    //   8     r/w    0xFF        Volume for playback
++#define REG_VOL_SOUND                 (REG_REGISTERS_BASE+0x084+REG_1_BYTE)    //   8     r/w    0xFF        Volume for synthesizer sound
++#define REG_SOUND                     (REG_REGISTERS_BASE+0x088+REG_2_BYTES)   //  16     r/w    0x0000      Sound effect select
++#define REG_PLAY                      (REG_REGISTERS_BASE+0x08C+REG_1_BYTE)    //   1     r/w    0           Start effect playback
++#define REG_GPIO_DIR                  (REG_REGISTERS_BASE+0x090+REG_1_BYTE)    //   8     r/w    0x80        GPIO Pin direction; 0=IN; 1=OUT
++#define REG_GPIO                      (REG_REGISTERS_BASE+0x094+REG_1_BYTE)    //   8     r/w    0x00        GPIO pin value (bit 0,1,7); strength on 2-6
++#define REG_GPIOX_DIR                 (REG_REGISTERS_BASE+0x098+REG_2_BYTES)   //  16     r/w    0x8000      Extended gpio pin direction input=0 output=1
++#define REG_GPIOX                     (REG_REGISTERS_BASE+0x09C+REG_2_BYTES)   //  16     r/w    0x0080      Extended gpio read/write
++#define  GPIOX_GPIO0	0x00000001
++#define  GPIOX_GPIO1	0x00000002
++#define  GPIOX_GPIO2	0x00000004
++#define  GPIOX_GPIO3	0x00000008
++//       reserved      0x000001F0
++#define  GPIOX_INT_N	0x00000200
++#define  GPIOX_S1_MASK 0x00000C00
++#define  GPIOX_S1_5mA	0x00000000
++#define  GPIOX_S1_10mA	0x00000400
++#define  GPIOX_S1_15mA	0x00000800
++#define  GPIOX_S1_20mA	0x00000C00
++#define  GPIOX_S2_MASK 0x00001000
++#define  GPIOX_S2_5mA	0x00000000
++#define  GPIOX_S2_10mA	0x00001000
++#define  GPIOX_S3_MASK 0x00006000
++#define  GPIOX_S3_5mA	0x00000000
++#define  GPIOX_S3_10mA	0x00002000
++#define  GPIOX_S3_15mA	0x00004000
++#define  GPIOX_S3_20mA	0x00006000
++#define  GPIOX_DISP	0x00008000
++//       reserved      0xFFFF0000
++// Reserved                           (REG_REGISTERS_BASE+0x0A0)
++// Reserved                           (REG_REGISTERS_BASE+0x0A4)
++#define REG_INT_FLAGS                 (REG_REGISTERS_BASE+0x0A8+REG_1_BYTE)    //   8     r/o    0x00        Interrupt flash; clear by reading
++#define REG_INT_EN                    (REG_REGISTERS_BASE+0x0AC+REG_1_BYTE)    //   1     r/w    0           Global interrupt enable
++#define REG_INT_MASK                  (REG_REGISTERS_BASE+0x0B0+REG_1_BYTE)    //   8     r/w    0xFF        Interrupt enable mask
++#define  INT_MASK_SWAP		0x01
++#define  INT_MASK_TOUCH		0x02
++#define  INT_MASK_TAG		0x04
++#define  INT_MASK_SOUND		0x08
++#define  INT_MASK_PLAYBACK	0x10
++#define  INT_MASK_CMDEMPTY	0x20
++#define  INT_MASK_CMDFLAG	0x40
++#define  INT_MASK_CONVCOMPLETE	0x80
++#define REG_PLAYBACK_START            (REG_REGISTERS_BASE+0x0A4+REG_3_BYTES)   //  20     r/w    0x00000     Audio playback RAM start address
++#define REG_PLAYBACK_LENGTH           (REG_REGISTERS_BASE+0x0B8+REG_3_BYTES)   //  20     r/w    0x00000     Audio playback sample length (bytes)
++#define REG_PLAYBACK_READPTR          (REG_REGISTERS_BASE+0x0BC+REG_3_BYTES)   //  20     r/o    -           Audio playback current read pointer
++#define REG_PLAYBACK_FREQ             (REG_REGISTERS_BASE+0x0C0+REG_2_BYTES)   //  16     r/w    8000        Audio playback sampling frequency
++#define REG_PLAYBACK_FORMAT           (REG_REGISTERS_BASE+0x0C4+REG_1_BYTE)    //   2     r/w    0           Audio playback format
++#define REG_PLAYBACK_LOOP             (REG_REGISTERS_BASE+0x0C8+REG_1_BYTE)    //   1     r/w    0           Audio playback loop enable
++#define REG_PLAYBACK_PLAY             (REG_REGISTERS_BASE+0x0CC+REG_1_BYTE)    //   1     r/o    0           Start audio playback
++#define REG_PWM_HZ                    (REG_REGISTERS_BASE+0x0D0+REG_2_BYTES)   //  14     r/w    250         BACKLIGHT PWM output frequency (Hz)
++#define REG_PWM_DUTY                  (REG_REGISTERS_BASE+0x0D4+REG_1_BYTE)    //   8     r/w    128         BACKLIGHT PWM output duty cycle 0=0%, 128=100%
++#define REG_MACRO_0                   (REG_REGISTERS_BASE+0x0D8+REG_4_BYTES)   //  32     r/w    0x00000000  Display list macro command 0
++#define REG_MACRO_1                   (REG_REGISTERS_BASE+0x0DC+REG_4_BYTES)   //  32     r/w    0x00000000  Display list macro command 1
++// Reserved                           (REG_REGISTERS_BASE+0x0E0)
++// Reserved                           (REG_REGISTERS_BASE+0x0E4)
++// Reserved                           (REG_REGISTERS_BASE+0x0E8)
++// Reserved                           (REG_REGISTERS_BASE+0x0EC)
++// Reserved                           (REG_REGISTERS_BASE+0x0F0)
++// Reserved                           (REG_REGISTERS_BASE+0x0F4)
++#define REG_CMD_READ                  (REG_REGISTERS_BASE+0x0F8+REG_2_BYTES)   //  12     r/w    0           Command buffer read pointer
++#define REG_CMD_WRITE                 (REG_REGISTERS_BASE+0x0FC+REG_2_BYTES)   //  12     r/w    0           Command buffer write pointef
++#define REG_CMD_DL                    (REG_REGISTERS_BASE+0x100+REG_2_BYTES)   //  13     r/w    0           Command display list offset
++#define REG_CTOUCH_MODE               (REG_REGISTERS_BASE+0x104+REG_1_BYTE)    //   2     r/w    3           Touch-screen sampling mode
++#define  CTOUCH_MODE_OFF		0
++#define  CTOUCH_MODE_CONTINUOUS		3
++#define REG_TOUCH_MODE                REG_CTOUCH_MODE
++#define  TOUCH_MODE_OFF		0
++#define  TOUCH_MODE_ONE_SHOT	1
++#define  TOUCH_MODE_FRAME_SYNC	2
++#define  TOUCH_MODE_CONTINUOUS	3
++#define REG_CTOUCH_EXTENDED           (REG_REGISTERS_BASE+0x108+REG_1_BYTE)    //   1     r/w    1           Capacitive touch mode: 0:multitouch 1:single
++#define REG_TOUCH_CHARGE              (REG_REGISTERS_BASE+0x10C+REG_2_BYTES)   //  16     r/w    9000        Touch charge time units of 6 clocks
++#define REG_TOUCH_SETTLE              (REG_REGISTERS_BASE+0x110+REG_1_BYTE)    //   4     r/w    3           Touch settle time units of 6 clocks
++#define REG_TOUCH_OVERSAMPLE          (REG_REGISTERS_BASE+0x114+REG_1_BYTE)    //   4     r/w    7           Touch oversample  factor
++#define REG_TOUCH_RZTHRESH            (REG_REGISTERS_BASE+0x118+REG_2_BYTES)   //  16     r/w    0xFFFF      Touch resistance threshold
++#define REG_TOUCH_RAW_XY              (REG_REGISTERS_BASE+0x11C+REG_4_BYTES)   //  32     r/o    -           Touch screen raw; msb16=x; lsb16=y (multitouch = touch 1)
++#define REG_CTOUCH_TOUCH1_XY              REG_TOUCH_RAW_XY
++#define REG_TOUCH_RZ                  (REG_REGISTERS_BASE+0x120+REG_4_BYTES)   //  32     r/o    -           Touch screen raw; msb16=x; lsb16=y (multitouch = touch 4)
++#define REG_CTOUCH_TOUCH_4                REG_TOUCH_RZ
++#define REG_TOUCH_SCREEN_XY           (REG_REGISTERS_BASE+0x124+REG_4_BYTES)   //  32     r/o    -           Touch 0
++#define REG_CTOUCH_TOUCH_XY               REG_TOUCH_SCREEN_XY
++#define REG_TOUCH_TAG_XY              (REG_REGISTERS_BASE+0x128+REG_4_BYTES)   //  32     r/o    -           Touch
++#define REG_TOUCH_TAG                 (REG_REGISTERS_BASE+0x12C+REG_1_BYTE)    //   8     r/o    -           Touch tag results
++#define REG_TOUCH_TAG1_XY             (REG_REGISTERS_BASE+0x130+REG_4_BYTES)   //  32     r/o    -           Touch screen tag 1
++#define REG_TOUCH_TAG1                (REG_REGISTERS_BASE+0x134+REG_1_BYTE)    //   8     r/o    -           Touch screen tag 1 results
++#define REG_TOUCH_TAG2_XY             (REG_REGISTERS_BASE+0x138+REG_4_BYTES)   //  32     r/o    -           Touch screen tag 2
++#define REG_TOUCH_TAG2                (REG_REGISTERS_BASE+0x13C+REG_1_BYTE)    //   8     r/o    -           Touch screen tag 2 results
++#define REG_TOUCH_TAG3_XY             (REG_REGISTERS_BASE+0x140+REG_4_BYTES)   //  32     r/o    -           Touch screen tag 3
++#define REG_TOUCH_TAG3                (REG_REGISTERS_BASE+0x144+REG_1_BYTE)    //   8     r/o    -           Touch screen tag 3 results
++#define REG_TOUCH_TAG4_XY             (REG_REGISTERS_BASE+0x148+REG_4_BYTES)   //  32     r/o    -           Touch screen tag 4
++#define REG_TOUCH_TAG4                (REG_REGISTERS_BASE+0x14C+REG_1_BYTE)    //   8     r/o    -           Touch screen tag 4 results
++#define REG_TOUCH_TRANSFORM_A         (REG_REGISTERS_BASE+0x150+REG_4_BYTES)   //  32     r/w    0x00010000  Touch-screen transform coefficient (signed 15.16)
++#define REG_TOUCH_TRANSFORM_B         (REG_REGISTERS_BASE+0x154+REG_4_BYTES)   //  32     r/w    0x00000000  Touch-screen transform coefficient
++#define REG_TOUCH_TRANSFORM_C         (REG_REGISTERS_BASE+0x158+REG_4_BYTES)   //  32     r/w    0x00000000  Touch-screen transform coefficient
++#define REG_TOUCH_TRANSFORM_D         (REG_REGISTERS_BASE+0x15C+REG_4_BYTES)   //  32     r/w    0x00000000  Touch-screen transform coefficient
++#define REG_TOUCH_TRANSFORM_E         (REG_REGISTERS_BASE+0x160+REG_4_BYTES)   //  32     r/w    0x00010000  Touch-screen transform coefficient
++#define REG_TOUCH_TRANSFORM_F         (REG_REGISTERS_BASE+0x164+REG_4_BYTES)   //  32     r/w    0x00000000  Touch-screen transform coefficient
++#define REG_TOUCH_CONFIG              (REG_REGISTERS_BASE+0x168+REG_2_BYTES)   //  16     r/w    xx          0x0381 ft812  0x8381 ft813
++#define REG_TOUCH_TOUCH4_X            (REG_REGISTERS_BASE+0x16C+REG_2_BYTES)   //  16     r/o    -           Touch data for touch 4
++// Reserved                           (REG_REGISTERS_BASE+0x170)
++#define REG_BIST_EN                   (REG_REGISTERS_BASE+0x174+REG_1_BYTE)    //   1     r/w    0           BITS memory mappiing
++// Reserved                           (REG_REGISTERS_BASE+0x178)
++// Reserved                           (REG_REGISTERS_BASE+0x17C)
++#define REG_TRIM                      (REG_REGISTERS_BASE+0x180+REG_1_BYTE)    //   5     r/w    0           Internal relaxation clock trim
++#define REG_ANA_COMP                  (REG_REGISTERS_BASE+0x184+REG_1_BYTE)    //   8     r/w    0           Analog control register
++#define REG_SPI_WIDTH                 (REG_REGISTERS_BASE+0x188+REG_1_BYTE)    //   3     r/w    0           QSPI bus width
++#define  SPI_BUS_WIDTH_EXTRA_CYCLE   0x04
++#define  SPI_BUS_WIDTH_1BIT          0x00
++#define  SPI_BUS_WIDTH_2BITS         0x01
++#define  SPI_BUS_WIDTH_4BITS         0x02
++// Reserved                          0x03
++#define REG_CTOUCH_DIRECT_XY          (REG_REGISTERS_BASE+0x18C+REG_4_BYTES)    //  32     r/o    -
++#define REG_CTOUCH_DIRECT_Z           (REG_REGISTERS_BASE+0x190+REG_4_BYTES)    //  32     r/o    -
++#define REG_CTOUCH_TOUCH2_XY              REG_CTOUCH_DIRECT_Z
++// Reserved                           (REG_REGISTERS_BASE+0x194)
++// ...
++// Reserved                           (REG_REGISTERS_BASE+0x560)
++#define REG_DATESTAMP                 (REG_REGISTERS_BASE+0x564+REG_BLOCK)      // 128     r/o    -          Stamp date code
++#define REG_CMBD_SPACE                (REG_REGISTERS_BASE+0x574+REG_2_BYTES)    //  12     r/w    0xFFC      Command DL (bulk) space available
++#define REG_CMBD_WRITE                (REG_REGISTERS_BASE+0x578+REG_4_BYTES)    //  32     r/w    0          Command DL (bulk) write
++
++//#define REG_TRACKER                   0x109000
++#endif // __fb_ft81x_h_included
+diff --git a/drivers/staging/fbtft/fbtft-core.c b/drivers/staging/fbtft/fbtft-core.c
+index 6d0363d..3092d3bd 100644
+--- a/drivers/staging/fbtft/fbtft-core.c
++++ b/drivers/staging/fbtft/fbtft-core.c
+@@ -636,6 +636,8 @@ static void fbtft_merge_fbtftops(struct fbtft_ops *dst, struct fbtft_ops *src)
+ 		dst->set_var = src->set_var;
+ 	if (src->set_gamma)
+ 		dst->set_gamma = src->set_gamma;
++	if (src->deinit_display)
++		dst->deinit_display = src->deinit_display;
+ }
+ 
+ /**
+@@ -995,6 +997,8 @@ int fbtft_register_framebuffer(struct fb_info *fb_info)
+ reg_fail:
+ 	if (par->fbtftops.unregister_backlight)
+ 		par->fbtftops.unregister_backlight(par);
++	if (par->fbtftops.deinit_display)
++		par->fbtftops.deinit_display(par);
+ 
+ 	return ret;
+ }
+@@ -1015,6 +1019,8 @@ int fbtft_unregister_framebuffer(struct fb_info *fb_info)
+ 
+ 	if (par->fbtftops.unregister_backlight)
+ 		par->fbtftops.unregister_backlight(par);
++	if (par->fbtftops.deinit_display)
++		par->fbtftops.deinit_display(par);
+ 	fbtft_sysfs_exit(par);
+ 	return unregister_framebuffer(fb_info);
+ }
+diff --git a/drivers/staging/fbtft/fbtft.h b/drivers/staging/fbtft/fbtft.h
+index 488ab78..417a434 100644
+--- a/drivers/staging/fbtft/fbtft.h
++++ b/drivers/staging/fbtft/fbtft.h
+@@ -64,6 +64,7 @@ struct fbtft_par;
+  * @set_var: Configure LCD with values from variables like @rotate and @bgr
+  *           (optional)
+  * @set_gamma: Set Gamma curve (optional)
++ * @deinit_display: Prepare for uninstalling display driver (optional)
+  *
+  * Most of these operations have default functions assigned to them in
+  *     fbtft_framebuffer_alloc()
+@@ -93,6 +94,7 @@ struct fbtft_ops {
+ 
+ 	int (*set_var)(struct fbtft_par *par);
+ 	int (*set_gamma)(struct fbtft_par *par, u32 *curves);
++	int (*deinit_display)(struct fbtft_par *par);
+ };
+ 
+ /**
+diff --git a/drivers/staging/fbtft/fbtft_device.c b/drivers/staging/fbtft/fbtft_device.c
+index 0d97473..cf154d2 100644
+--- a/drivers/staging/fbtft/fbtft_device.c
++++ b/drivers/staging/fbtft/fbtft_device.c
+@@ -1214,6 +1214,50 @@ static struct fbtft_device_display displays[] = {
+ 			}
+ 		}
+ 	}, {
++		.name = "ft801",
++		.spi = &(struct spi_board_info) {
++			.modalias = "fb_ft801",
++			.max_speed_hz = 48000000,
++			.mode = SPI_MODE_0,
++			.platform_data = &(struct fbtft_platform_data) {
++				.display = {
++					.buswidth = 8,
++					.backlight = 1,
++				},
++#if 0
++				.bgr = true,
++#endif
++				.gpios = (const struct fbtft_gpio []) {
++					{ "dc", 0 },    // This MUST be defined to pass test, but is not used by driver.
++					{ "pd", 2 },    // Power down
++					{ "int", 25 },	// Interrupt (mostly for touch screen)
++					{},
++				},
++			}
++		}
++	}, {
++		.name = "ft81x",
++		.spi = &(struct spi_board_info) {
++			.modalias = "fb_ft81x",
++			.max_speed_hz = 28000000, /* Should be 60 but interface sucks */
++			.mode = SPI_MODE_0,
++			.platform_data = &(struct fbtft_platform_data) {
++				.display = {
++					.buswidth = 8,
++					.backlight = 1,
++				},
++#if 0
++				.bgr = true,
++#endif
++				.gpios = (const struct fbtft_gpio []) {
++					{ "dc", 0 },    // This MUST be defined to pass test, but is not used by driver.
++					{ "pd", 2 },    // Power down
++					{ "int", 25 },	// Interrupt (mostly for touch screen)
++					{},
++				},
++			}
++		}
++	}, {
+ 		/* This should be the last item.
+ 		 * Used with the custom argument
+ 		 */
+-- 
+2.7.4
+

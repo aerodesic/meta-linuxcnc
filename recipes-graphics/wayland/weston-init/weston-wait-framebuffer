@@ -1,0 +1,15 @@
+#!/bin/bash
+# Wait for frame buffer up to 10 seconds
+FB=$1
+counter=0
+while [[ "$counter" -lt 10 ]]; do
+  if [ -e ${FB} ]; then
+    echo "Frame buffer ${FB} found."
+    counter=10
+  elif [[ "$counter" -gt 10 ]]; then
+    echo "Frame buffer ${FB} ***NOT FOUND***"
+  else
+    counter=$((counter+1))
+    sleep 1
+  fi
+done

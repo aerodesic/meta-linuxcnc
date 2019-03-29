@@ -1,0 +1,4 @@
+# Same as default, but add the TAG+="systempd" so we get notification for systemd start of hwclock
+SUBSYSTEM=="rtc", ATTR{hctosys}=="1", SYMLINK+="rtc"
+SUBSYSTEM=="rtc", KERNEL=="rtc0", SYMLINK+="rtc", OPTIONS+="link_priority=-100" TAG+="systemd"
+

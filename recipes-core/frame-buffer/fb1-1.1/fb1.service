@@ -1,0 +1,12 @@
+[Unit]
+Description=Fired when path comes up
+
+[Service]
+Type=oneshot
+RemainAfterExit=True
+EnvironmentFile=/etc/default/weston-systemd
+ExecStart=/usr/sbin/weston-wait-framebuffer ${WESTON_FRAMEBUFFER}
+
+[Install]
+WantedBy=sysinit.target
+

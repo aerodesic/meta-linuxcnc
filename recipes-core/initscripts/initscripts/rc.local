@@ -1,0 +1,3 @@
+#!/bin/sh
+modprobe spi_bcm2835
+modprobe fbtft_device name=ft81x

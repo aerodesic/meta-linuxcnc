@@ -1,0 +1,10 @@
+[Unit]
+Description=Wait for /dev/fb1 to exist
+
+[Path]
+PathExists=/dev/fb1
+# Unit=fb1.service
+
+[Install]
+WantedBy=sysinit.target
+

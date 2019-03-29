@@ -1,0 +1,53 @@
+From fd0a313fdec2c36b0b7971a7fba36b783e5ea55b Mon Sep 17 00:00:00 2001
+From: Gary Oliver <go@aerodesic.com>
+Date: Thu, 15 Feb 2018 09:28:03 -0800
+Subject: [PATCH] Added overlay for ds3234 on raspberrypi spi1,1
+
+---
+ arch/arm/boot/dts/overlays/Makefile                |  1 +
+ .../boot/dts/overlays/spi-rtc-ds3234-overlay.dts   | 33 ++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+ create mode 100644 arch/arm/boot/dts/overlays/spi-rtc-ds3234-overlay.dts
+
+diff --git a/arch/arm/boot/dts/overlays/Makefile b/arch/arm/boot/dts/overlays/Makefile
+index eae6a66..fde22c1e 100644
+--- a/arch/arm/boot/dts/overlays/Makefile
++++ b/arch/arm/boot/dts/overlays/Makefile
+@@ -108,6 +108,7 @@ dtbo-$(CONFIG_ARCH_BCM2835) += \
+ 	smi-nand.dtbo \
+ 	spi-gpio35-39.dtbo \
+ 	spi-rtc.dtbo \
++	spi-rtc-ds3234.dtbo \
+ 	spi0-cs.dtbo \
+ 	spi0-hw-cs.dtbo \
+ 	spi1-1cs.dtbo \
+diff --git a/arch/arm/boot/dts/overlays/spi-rtc-ds3234-overlay.dts b/arch/arm/boot/dts/overlays/spi-rtc-ds3234-overlay.dts
+new file mode 100644
+index 0000000..b1d120c
+--- /dev/null
++++ b/arch/arm/boot/dts/overlays/spi-rtc-ds3234-overlay.dts
+@@ -0,0 +1,21 @@
++/dts-v1/;
++/plugin/;
++
++/ {
++    compatible = "brcm,bcm2708";
++    fragment@0 {
++        target = <&spi0>;
++        __overlay__ {
++            spidev@0 {
++                status = "disabled";
++            };
++            ds3234@0 {
++                compatible = "ds3234";
++                reg = <1>;
++                #address-cells = <1>;
++                #size-cells = <0>;
++                spi-max-frequency = <500000>;
++            };
++        };
++    };
++};
+-- 
+2.7.4
+

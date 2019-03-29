@@ -1,0 +1,5 @@
+#!/bin/bash
+# Wait for psplash to terminate
+while [ -e /tmp/psplash_fifo ];  do
+    sleep 1;
+done

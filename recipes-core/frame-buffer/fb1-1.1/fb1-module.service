@@ -1,0 +1,14 @@
+[Unit]
+Description=Enable fb1 modules
+
+[Service]
+User=root
+Type=simple
+RemainAfterExit=True
+ExecStartPre=/sbin/modprobe spi_bcm2835
+ExecStart=/sbin/modprobe fbtft_device name=ft81x
+# ExecStop=/sbin/modprobe -r fbtft_device fb_ft81x
+
+[Install]
+WantedBy=sysinit.target
+

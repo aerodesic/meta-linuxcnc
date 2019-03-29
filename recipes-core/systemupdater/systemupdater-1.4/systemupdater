@@ -1,0 +1,721 @@
+#! /usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
+#######################################################################################################
+# Copyright 2019, CPAC Equipment, Inc.
+# All rights reserved.
+#######################################################################################################
+
+#
+# Package updater.
+#
+# Sign:
+#    gpg -u <keyid> -a --output <package>.asc --detach-sig --passphrase-file ../conf/signing_passphrase <package>
+# Verify
+#    gpg -u <keyid> --verify <package>.asc <package>
+#
+#
+# systemupdater.
+#
+# This application runs BEFORE the main application starts.
+#
+# If an update.zip file is found, it's contents are extracted to temp directory,
+# and each of the individual packages are inspected for a valid signature.
+# If all files are good, a 'rollback' package will be created for the installation.
+# The file will be named 'rollback-<version>-<date>.zip.  The <version> will
+# be taken from the version of the current <systemversion> package version number.
+#
+# For each package to be installed:
+# 
+#   if the package is already installed:
+#       a rollback package will be generated with the name
+#           <package name>_<version>_<architecture>.deb
+#       and appended to the zip file list.  The <version> and <architecture>
+#       will be obtained from the /var/lib/dpkg/status file.  The control
+#       will be created from the entire record from the status file.
+#       Any preinst, postinst, prerm, postrm files will be taken from the
+#       /var/lib/dpkg/info directory for the package being installed.
+#
+#   otherwise
+#
+#       a record with the package name will be written to the 'uninstall' file
+#       which will be added to the rollback zip file.
+#
+#   When complete, the file will be created in the /home/<HOME>/software_updates
+#   directory.
+#
+
+import sys
+import pwd
+import grp
+import argparse
+import os
+from threading import Lock
+import shutil
+import zipfile
+import tempfile
+import time
+import syslog
+from shutil import copyfile
+from datetime import datetime
+import tarfile
+import io
+import json
+import traceback
+import subprocess
+import errno
+
+_DPKG_INFO_ROOT = "/var/lib/dpkg/info"
+_DPKG_STATUS_FILE = "/var/lib/dpkg/status"
+
+_SPECIAL_FILES = ( "uninstall", )
+
+def RunCommand(cmd):
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None) as process:
+        stdout, stderr = process.communicate()
+
+        rc = process.wait()
+
+    return rc, stdout.decode()
+
+# Resize the root partition.  Return True if we did it.
+def ResizeRoot():
+    reboot = False
+    
+    # Obtain the root file system partition information
+    rc, results = RunCommand(("findmnt", "-J", "/"))
+    if rc == 0:
+        output = json.loads(results)
+
+        root_partition_path = output["filesystems"][0]["source"]
+        root_partition_base = os.path.basename(root_partition_path)
+
+        send_message("Checking ROOT image")
+
+        # Get current partition size
+        rc, results = RunCommand(("lsblk", "-no", "pkname", root_partition_path))
+        if rc == 0:
+            device = "/dev/" + results.strip()
+
+            # Read partition table information
+            rc, results = RunCommand(("lsblk", "-J", "-b", device))
+            if rc == 0:
+                root_size = None
+                devinfo = json.loads(results)
+                partitions = devinfo["blockdevices"][0]["children"]
+                for part in partitions:
+                    if part["name"] == root_partition_base:
+                        root_size = int(part["size"])
+
+                if root_size != None and root_size < 1500000000:
+                    # Need to resize
+                    # Mount read-only and check results
+                    if os.system("mount -oremount,ro /") == 0:
+                        rc = os.system("fsck -y %s" % root_partition_path)
+                        os.system("mount -oremount,rw /")
+
+                        if rc == 0:
+                            root_partition_num = root_partition_path[len(device):]
+                            # Trim extra stuff from partition number in name
+                            while not root_partition_num[0].isdigit():
+                                root_partition_num = root_partition_num[1:]
+
+                            root_partition_num = int(root_partition_num)
+
+                            # Get the value to apply to resizing of root partition
+                            root_resize = int(devinfo["blockdevices"][0]["size"]) / (1024 * 1024) - 1
+                            send_message("Resizing ROOT image...")
+                            if os.system("parted %s resizepart %d %d" % (device, root_partition_num, root_resize)) == 0:
+                                if os.system("resize2fs %s" % root_partition_path) == 0:
+                                    reboot = True
+ 
+                            if not reboot:
+                                send_message("Resize ROOT failed")
+
+    return reboot
+
+def GetHomeDir():
+    home = os.getenv("HOME")
+    if home == None or home == "":
+        home = os.getcwd()
+    return home
+
+def send_message(msg, delay=0):
+    os.system('psplash-write "MSG %s"' % msg)
+    if delay:
+        time.sleep(delay)
+    # print(msg)
+
+def send_progress(n, total):
+    os.system('psplash-write "PROGRESS %d"' % (100 * n / total))
+    # print("%d of %d" % (n, total))
+
+# Compare two files for version number differences.
+# Return -1 if file1 version < file2 version
+#         1 if file1 version > file2 version
+#         0 if file1 version == file2 version
+#
+# This compare is simplistic and is not compatible with debian package versions
+# without modification to support <epoch> and alpha fields.  This only used
+# with the versions found in systemversion package numbering at the moment.
+#
+def compare_version(file1, file2, extension = None):
+    # Remove extension if exists
+    if extension != None:
+        if file1[-len(extension):] == extension:
+            file1 = file1[0:-len(extension)]
+        if file2[-len(extension):] == extension:
+            file2 = file2[0:-len(extension)]
+
+    # Split off version of both paths (if they have one)
+    version1 = file1.split('_', 1)[1] if '_' in file1 else ''
+    version2 = file2.split('_', 1)[1] if '_' in file2 else ''
+
+    # Convert version numbers to list of numbers.
+    version1 = [ int(x) for x in version1.split('.')]
+    version2 = [ int(x) for x in version2.split('.')]
+
+    # Add zeros to end of shorted version string
+    length_diff = len(version1) < len(version2)
+    if length_diff > 0:
+        version1.extend([0] * length_diff)
+    elif length_diff < 0:
+        version2.extent([0] * -length_diff)
+
+    # Return -1 0 or 1 depending on
+    for i in range(len(version1)):
+        if version1[i] < version2[i]:
+            return -1
+        elif version1[i] > version2[i]:
+            return 1
+
+    # No difference - return equality
+    return 0
+
+# Read next control block from status file
+def read_info(file):
+    # Read until a 'Package' line
+    buf = file.readline()
+    while buf != "" and buf[0:8] != "Package:":
+        buf = file.readline()
+
+    if buf != "":
+        items = buf.split(":", 1)
+        name = items[0].strip()
+
+        control = { name: items[1].strip() }
+
+        buf = file.readline()
+        while buf != "" and buf != "\n":
+            items = buf.split(":", 1)
+            # If only one thing in list, then this gets appended to previous
+            if len(items) == 1:
+                # Convert singleton to list
+                if type(control[name]) != type([]):
+                    control[name] = [ control[name], ]
+                control[name].append(items[0].strip())
+            else:
+                name = items[0].strip()
+                control[name] = items[1].strip()
+            buf = file.readline()
+    else:
+        control = None
+
+    return control
+
+# Get the 'control' info from the status file
+def get_package_control_info(package):
+    with open(_DPKG_STATUS_FILE, "r") as status:
+        done = False
+        while not done:
+            info = read_info(status)
+            if info == None or info["Package"] == package:
+                done = True
+    return info
+
+def build_rollback_package_for(installs):
+    send_message("Building rollback...")
+    rollbacks = False
+    rollback = None
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_rollback_dir:
+            count = -1
+            for install in installs:
+                count += 1
+                send_progress(count, len(installs))
+                package_info = install.split("_")
+                package_name = package_info[0]
+                new_version = package_info[1]
+
+                # Look up the control info for the packages, as is currently installed
+                package_control = get_package_control_info(package_name)
+                if package_control != None:
+                    # It is installed, and a different version - create the rollback file package
+                    package_file_name = "%s_%s_%s.deb" % (package_name, package_control["Version"], package_control["Architecture"])
+                    # Remember we have rollbacks to report to caller.
+                    rollbacks = True
+
+                    # Create a temperory directory for the '.deb' package to be built
+                    with tempfile.TemporaryDirectory() as temp_package_dir:
+                        # Create the 'debian-binary' file containing deb packaging version
+                        with open(os.path.join(temp_package_dir, "debian-binary"), "w") as f:
+                            f.write("2.0\n")
+
+                        # Create the 'control.tar.gz' file in this directory
+                        with tarfile.open(os.path.join(temp_package_dir, "control.tar.gz"), "w:gz") as control_tar_gz:
+                            buf = io.BytesIO()
+
+                            # Write a canonical control file
+                            for item in [ "Package", "Version", "Description", "Section", "Priority", "Maintainer", "Architecture", "OE", "PackageArch", "Homepage", "Depends" ]:
+                                if item in package_control:
+                                    data = package_control[item]
+                                    if type(data) == type([]):
+                                        # Multi-line value
+                                        buf.write(("%s: %s\n" % (item, data[0])).encode())
+                                        # Write remainder with space as first character
+                                        for line in range(1, len(data)):
+                                            buf.write((" %s\n" % data[line]).encode())
+                                    else:
+                                        buf.write(("%s: %s\n" % (item, data)).encode())
+                                
+                            # Create dir entry item
+                            tarinfo = tarfile.TarInfo(name="./")
+                            tarinfo.type = tarfile.DIRTYPE
+                            tarinfo.mode = 0o777 
+                            tarinfo.uname = "root"
+                            tarinfo.gname = "root"
+                            control_tar_gz.addfile(tarinfo)
+
+                            # Create the control file in the control.tar.gz
+                            tarinfo = tarfile.TarInfo(name="./control")
+                            tarinfo.uname = "root"
+                            tarinfo.gname = "root"
+                            tarinfo.size = buf.tell()
+                            buf.seek(0)
+                            control_tar_gz.addfile(tarinfo, buf)
+
+                            # Build any pre/post files if necessary
+                            for prepostfile in [ "preinst", "postinst", "prerm", "postrm" ]:
+                                prepostpath = os.path.join(_DPKG_INFO_ROOT, package_name + "." + prepostfile)
+                                if os.path.isfile(prepostpath):
+                                    buf = io.BytesIO()
+                                    mtime = os.path.getmtime(prepostpath)
+                                    with open(prepostpath, "r") as f:
+                                        data = f.read()
+                                        buf.write(data.encode())
+                                        tarinfo = tarfile.TarInfo(name=prepostfile)
+                                        tarinfo.uname = "root"
+                                        tarinfo.gname = "root"
+                                        tarinfo.size = buf.tell()
+                                        tarinfo.mtime = mtime
+                                        buf.seek(0)
+                                        control_tar_gz.addfile(tarinfo, buf)
+
+                            # Copy any 'conffiles' description file for this package
+                            conffiles_in = os.path.join(_DPKG_INFO_ROOT, package_name + ".conffiles")
+                            if os.path.isfile(conffiles_in):
+                                mtime = os.path.getmtime(conffiles_in)
+                                with open(conffiles_in, "r") as infile:
+                                    buf = io.BytesIO()
+                                    buf.write(infile.read().encode())
+                                    tarinfo = tarfile.TarInfo("conffiles")
+                                    tarinfo.uname = "root"
+                                    tarinfo.gname = "root"
+                                    tarinfo.size = buf.tell()
+                                    tarinfo.mtime = mtime
+                                    buf.seek(0)
+                                    control_tar_gz.addfile(tarinfo, buf)
+
+                        # Create a temp directory for building the tar file using symbolic links
+                        with tempfile.TemporaryDirectory() as temp_data_dir:
+                            os.chmod(temp_data_dir, 0o777)
+                            # Go through the list of files installed and add them to the directory
+                            with open(os.path.join(_DPKG_INFO_ROOT, package_name + ".list"), "r") as files:
+                                # For each file, create a symbolic link to the real file and then tar, dereferencing the links
+                                for filename in files:
+                                    # Strip spaces from input file
+                                    infile = filename.strip()
+                                    if os.path.isfile(infile):
+                                        dirname = os.path.dirname(temp_data_dir + infile)
+                                        if not os.path.isdir(dirname):
+                                            os.makedirs(os.path.dirname(temp_data_dir + infile))
+                                        os.symlink(infile, temp_data_dir + infile)
+
+                            os.system("tar -C %s -chzf %s/data.tar.gz ." % (temp_data_dir, temp_package_dir))
+
+                        # Now ar the results
+                        ar_command = "(cd %s; ar r %s debian-binary control.tar.gz data.tar.gz)" % (temp_package_dir, os.path.join(temp_rollback_dir, package_file_name))
+                        if os.system(ar_command) != 0:
+                            raise Exception("Unable to write %s" % package_file_name)
+
+                else:
+                    # Package was not installed.  Add to count and remember the rollback file was created for uninstalls
+                    rollbacks = True
+                    with open(os.path.join(temp_rollback_dir, "uninstall"), "a") as uninstall:
+                        uninstall.write(package_name + "\n")
+
+            # If any a rollback was created, create it as a file "rollback_<installed version>_<rolled back version>_date.zip
+            if rollbacks:
+                # We have actions, so create rollback zip file
+                with open("/etc/systemversion", "r") as verfile:
+                    # Read the version being upgraded.
+                    old_version = verfile.read().strip()
+                    # Create a list of { 'package': 'version' } map
+                    installed_packages = { p.split('_', 3)[0]: p.split('_', 3)[1] for p in installs }
+
+                    # If we are installing a version file, use it's version number as the new version
+                    if 'systemversion' in installed_packages:
+                        new_version = installed_packages['systemversion']
+                    else:
+                        # otherwise the new version will be the same as the old version (not changing.)
+                        new_version = old_version
+
+                    date = datetime.now().strftime("%04Y-%02m-%02d")
+                    rollback_dir = os.path.join(GetHomeDir(), "rollbacks")
+                    try:
+                        os.makedirs(rollback_dir)
+                    except OSError as exc:  # Python >2.5
+                        # If not an existing directory or it's not a real path...
+                        if exc.errno != errno.EEXIST or not os.path.isdir(rollback_dir):
+                            # Re-raise the exception
+                            raise
+
+                    rollback_file = os.path.join(rollback_dir, "rollback_%s_%s_%s.zip" % (new_version, old_version, date))
+                    with zipfile.ZipFile(rollback_file, mode="w") as rollback:
+                        # Write each file in the directory to the rollback zip file.
+                        for file in os.listdir(temp_rollback_dir):
+                            rollback.write(os.path.join(temp_rollback_dir, file), arcname=file)
+
+                    rollback = rollback_file
+
+            # Indicate complete
+            send_progress(1, 1)
+
+    except Exception as e:
+        send_message(str(e))
+        send_progress(1, 1)
+        rollback = None
+        with open(os.path.join(GetHomeDir(), "systemupdater.exception", "w") as f:
+            f.write("Exception '%s'\n\n" % str(e))
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_exception(exc_type, exc_value, exc_traceback, limit=5, file=f)
+           
+
+    # Return the rollback name if created
+    return rollback
+
+def rollback_update(rollback):
+    pass
+
+class SystemUpdater():
+
+    def prestart(self):
+        reboot =  ResizeRoot()
+
+        if not reboot:
+            reboot = self._check_for_updates()
+
+        if reboot:
+            os.system('sync')
+            send_message("Rebooting...", delay=1)
+            os.system('reboot -f')
+        else:
+            # Terminate psplash when not needed
+            os.system('psplash-write QUIT')
+
+    def mycmp(version1, version2):
+        parts1 = [int(x) for x in version1.split('.')]
+        parts2 = [int(x) for x in version2.split('.')]
+    
+        # fill up the shorter version with zeros ...
+        lendiff = len(parts1) - len(parts2)
+        if lendiff > 0:
+            parts2.extend([0] * lendiff)
+        elif lendiff < 0:
+            parts1.extend([0] * (-lendiff))
+    
+        for i, p in enumerate(parts1):
+            ret = cmp(p, parts2[i])
+            if ret: return ret
+        return 0
+
+    # Find the lowest 'version number' update.zip in the directory.
+    # 'update.zip' is lower than 'update_1.2.3.zip'
+    def _first_file_in_directory(self, search_dir, ends_with = ".zip", remove_if_not=True):
+        selected_file = None
+        if os.access(search_dir, 0):
+            for file in os.listdir(search_dir):
+                pathname = os.path.join(search_dir, file)
+                # Find first file that ends with 'ends_with'
+                if ends_with == None or file[-len(ends_with):] == ends_with:
+                    # If version number on file, use it to selected newest version
+                    if selected_file == None or compare_version(file, selected_file, extension=ends_with) < 0:
+                        # File is younger version, so use it.
+                        selected_file = file
+
+        return selected_file
+
+    # Rollback to a previous set of packages.
+    def _do_rollback(self, rollback):
+        reboot = False
+
+        try:
+            if rollback:
+                with tempfile.TemporaryDirectory() as tempdir:
+                    with zipfile.ZipFile(rollback) as rollback_file:
+                        rollback_file.testzip()
+
+                        rollback_file.extractall(tempdir)
+                        rollback_file.close()
+                        os.chmod(tempdir, 0o777)
+                        send_message("Rolling back...")
+                        if os.system("dpkg --force-downgrade -i %s/*.deb" % tempdir) != 0:
+                            send_message("Installation errors; ABORTING", delay=5)
+
+                        else:
+                            # If an 'uninstall' file exists, read it an uninstall all named packages
+                            try:
+                                with open(os.path.join(tempdir, "uninstall")) as uninstall:
+                                    packages = [ p.strip() for p in uninstall ]
+
+                                    # Delete any empty lines at end
+                                    while packages[-1] == "":
+                                        del(packages[-1])
+
+                                    num_packages = len(packages)
+
+                                    # Purge each package, but ignore errors.
+                                    for package in range(num_packages):
+                                        send_progress(package + 1, num_packages)
+                                        send_message("Uninstalling %s" % packages[package])
+                                        os.system("dpkg --purge %s" % packages[package])
+
+                            except:
+                                pass
+
+                            # Remove the rollback file so we don't try to do it again.
+                            os.unlink(rollback)
+                            send_message("Rollback successful", delay=5)
+                            reboot = True
+
+
+        except Exception as e:
+            send_message(str(e).upper(), delay=5)
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_exception(exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
+
+        return reboot
+
+
+    #
+    # Check for an update[-<version>].zip file. (Take first lowest version found)
+    # It will contain these items:
+    #    readme.txt          - Copy of the latest log from the application updates
+    #    <package>.deb       - A file to install
+    #    <package>.deb.asc   - An ascii signature of the package file for verification
+    #
+    # The file is processed, removed and then a reboot is performed.
+
+    def _check_for_updates(self):
+        send_message("Checking for updates...")
+
+        reboot = False
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            # Pick up the first file in the software_updates directory
+            update_file = self._first_file_in_directory(os.path.join(GetHomeDir(), "software_updates"))
+
+            if update_file != None:
+                update_file_path = os.path.join(GetHomeDir(), "software_updates", update_file)
+
+                send_message("Checking %s" % update_file, delay=1)
+
+                if os.access(update_file_path, 0):
+                    # send_message("Applying %s" % os.path.basename(update_file_path)[0:-4].upper())
+
+                    try:
+                        with zipfile.ZipFile(update_file_path) as update:
+                            update.testzip()
+
+                            # Unzip all to temp directory
+                            update.extractall(tempdir)
+                            update.close()
+
+                            # Make the files readable
+                            os.chmod(tempdir, 0o777)
+
+                            check_gpg = []
+                            installs = []
+                            # Find all files that need a gpg signature.
+                            for name in os.listdir(tempdir):
+                                if name[-4:] == ".deb":
+                                    check_gpg.append(name)
+                                    installs.append(name)
+                                elif name in _SPECIAL_FILES:
+                                    check_gpg.append(name)
+
+                            send_message("Checking signatures...")
+
+                            index = 1
+                            errors = 0
+                            for name in check_gpg:
+                                send_progress(index, len(check_gpg))
+
+                                full_name = os.path.join(tempdir, name)
+
+                                if os.system('HOME=/home/root gpg -u "Package Signing Key" --verify %s.asc %s' % (full_name, full_name)) != 0:
+                                    errors += 1
+
+                                index += 1
+
+                            if errors != 0:
+                                send_message("Package errors...")
+
+                            else:
+                                # Create update list with package name only so we can track progress bar actions.
+                                # Contains files to be upgrade.  When empty, all has been initiated for install
+                                upgrading = { x.split("_")[0]:x.split("_")[1] for x in installs }
+                                # Contains packages waiting for configuraiton.  When empty, all is configured
+                                configuring = {}
+                                # Contains packages waiting for completion of installation.  When empty all is installed
+                                installing = {}
+                                num_installs = len(installs)
+
+                                # Create the rollback package for these packages.  Returns the rollback name if successful.
+                                rollback = build_rollback_package_for(installs)
+
+                                read_pipe, write_pipe = os.pipe()
+                                # os.system("ls -l %s/*deb" % tempdir)
+                                # Attempt the install and report the progress
+                                command = [ "dpkg", "--force-downgrade", "--status-fd", "%d" % write_pipe, "-i" ] + [ "%s/%s" % (tempdir, f) for f in installs ]
+                                with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, pass_fds = (write_pipe,), close_fds=True) as process:
+                                    for line in iter(os.fdopen(read_pipe).readline, ""):
+                                        items = [ x.strip() for x in line.split(":") ]
+                                        if items[0] == "processing":
+                                            package = items[2]
+                                            if items[1] == "upgrade":
+                                                if package in upgrading:
+                                                    configuring[package] = upgrading[package]
+                                                    installing[package] = upgrading[package]
+                                                    del(upgrading[package])
+                                                    send_message("Unpacking %s" % package)
+                                                    send_progress(num_installs - len(upgrading), num_installs)
+                                                    # Add to configuring list so we report it's progress when the time has come
+                                            elif items[1] == "configure":
+                                                if package in configuring:
+                                                    send_message("Configuring %s" % package)
+                                                    del(configuring[package])
+                                                    send_progress(num_installs - len(configuring), num_installs)
+
+                                        elif items[0] == "status":
+                                            package = items[1]
+                                            if items[2] == "installed" or items[2] == "error":
+                                                if package in installing:
+                                                    del(installing[package])
+
+                                                if items[2] == "error":
+                                                    send_message(items[3], delay=5)
+
+                                        # When empty, we are done
+                                        if len(installing) == 0:
+                                            break
+
+                                    ok = process.wait()
+
+                                if ok == 0:
+                                    # Process the uninstall list
+                                    uninstalls = {}
+                                    with open(os.path.join(tempdir, "uninstall")) as f:
+                                        for line in f:
+                                            info = line.split("_", 3)
+                                            package = info[0].strip()
+                                            version = info[1].strip()
+                                            arch = info[2].strip()
+
+                                            uninstalls[package] = { "version": version, "arch": arch }
+
+                                    if len(uninstalls) != 0:        
+                                        num_uninstalls = len(uninstalls)
+
+                                        count = 0
+                                        for package in uninstalls:
+                                            version = uninstalls[package]["version"]
+                                            count += 1
+
+                                            # send_message("Testing uninstall %s_%s" % (package, version), delay=2)
+
+                                            # Fetch installed version of the package.  This will dump the entire control file.
+                                            with subprocess.Popen(("dpkg", "-s", package), stdout=subprocess.PIPE, stderr=None) as process:
+                                                # Extract the version number from the package header
+                                                installed_version = None
+                                                lines = process.stdout.readlines()
+                                                for line in lines:
+                                                    linedecode = line.decode()
+                                                    if linedecode[0:8] == "Version:":
+                                                        # Extract the Version number.
+                                                        installed_version = linedecode.split(":", 1)[1].strip()
+
+                                                if process.wait() == 0:
+                                                    # send_message("%s installed version %s" % (package, installed_version), delay=2)
+
+                                                    # Succeeded in getting a version, so see if it is the one we want to uninstall
+                                                    if version == installed_version:
+                                                        send_message("Removing %s_%s" % (package, version))
+                                                        send_progress(count, num_uninstalls)
+
+                                                        # Uninstall the package - it's the the right version
+                                                        os.system("dpkg --force-remove-essential --purge %s" % version)
+
+                                send_progress(1, 1)
+                                if ok != 0:
+                                    send_message("Installation errors; ABORTING", delay=5)
+
+                                    # Here is where we should do a 'roll back' in case a partial update was completed.
+                                    if self._do_rollback(rollback):
+                                        send_message("Successful rollback", delay=2)
+                                        reboot = True
+
+                                else:
+                                    send_message("Installation complete", delay=2)
+                                    reboot = True
+
+                    except Exception as e:
+                        # For now just send message to display
+                        send_progress(1, 1)
+                        send_message(str(e).upper(), delay=5)
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        traceback.print_exception(exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
+
+                    finally:
+                        # Remove the update file
+                        os.remove(update_file_path)
+
+        return reboot
+
+
+    def run(self):
+                                                     
+        self._spi_lock = Lock()
+
+        self.prestart()
+
+        return 0
+
+def main():
+    parser = argparse.ArgumentParser(description="systemupdater")
+
+    parser.add_argument("-w", "--wait", action="store", dest="wait_time", help="Wait time after message.", default=0)
+    parser.add_argument("rest", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+    
+    app = SystemUpdater()
+    rc = app.run()
+
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
+

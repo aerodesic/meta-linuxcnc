@@ -1,0 +1,10 @@
+[Unit] 
+Description=Wait for /dev/rtc to appear
+PartOf=hwclock-load.service
+
+[Path]
+PathExists=/dev/rtc
+
+[Install]
+WantedBy=multi-user.target
+

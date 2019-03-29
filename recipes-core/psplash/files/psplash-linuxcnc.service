@@ -1,0 +1,12 @@
+[Unit]
+Description=Starts Psplash Boot screen for RHPro startup.
+Requires=fb1.service
+After=fb1.service systemd-udev-trigger.service systemd-udevd.service
+DefaultDependencies=no
+
+[Service]
+ExecStart=/usr/bin/psplash -f 1 -n
+
+[Install]
+WantedBy=sysinit.target
+

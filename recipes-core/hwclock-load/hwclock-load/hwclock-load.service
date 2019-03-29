@@ -1,0 +1,15 @@
+[Unit]
+Description=Synchronise Hardware Clock to System Clock
+DefaultDependencies=no
+# After=sysinit.target
+Requires=dev-rtc0.device
+After=dev-rtc0.device
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/hwclock --hctosys --utc --rtc /dev/rtc
+ExecStop=/sbin/hwclock --systohc --utc --rtc /dev/rtc
+
+[Install]
+WantedBy=graphical.target multi-user.target
+

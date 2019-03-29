@@ -1,0 +1,2 @@
+WESTON_FRAMEBUFFER="/dev/fb1"
+OPTARGS="--config=/etc/weston.ini" --define=${WESTON_FRAMEBUFFER}

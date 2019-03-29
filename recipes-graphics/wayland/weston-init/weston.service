@@ -1,0 +1,17 @@
+[Unit]
+Description=Weston Wayland Compositor
+RequiresMountsFor=/run
+Requires=psplash-linuxcnc.service
+After=psplash-linuxcnc.service
+
+[Service]
+User=root
+Type=forking
+EnvironmentFile=/etc/default/weston-systemd
+ExecStartPre=/usr/sbin/weston-wait-framebuffer ${WESTON_FRAMEBUFFER}
+ExecStartPre=/usr/sbin/weston-wait-psplash
+ExecStart=/usr/bin/weston-start -- $OPTARGS --device=${WESTON_FRAMEBUFFER}
+
+[Install]
+WantedBy=multi-user.target
+

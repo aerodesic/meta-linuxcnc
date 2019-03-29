@@ -1,0 +1,16 @@
+[Unit]
+Description=Starts system updater service
+Requires=fb1.service
+After=fb1.service systemd-udev-trigger.service systemd-udevd.service
+After=psplash-linuxcnc.service
+DefaultDependencies=no
+
+[Service]
+User=root
+Type=oneshot
+Environment=HOME=/home/linuxcnc
+ExecStart=/usr/sbin/systemupdater.sh
+
+[Install]
+WantedBy=sysinit.target
+
