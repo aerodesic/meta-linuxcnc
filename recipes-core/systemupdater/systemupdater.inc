@@ -2,7 +2,10 @@ SUMMARY = "Updater for installed signed packages"
 HOMEPAGE = "http://ao-cs.com"
 MAINTAINER = "Gary Oliver <go@ao-cs.com>"
 SECTION = "optional"
-LICENSE = "GPLv2+"
+LICENSE = "GPLv2"
+
+LIC_FILES_CHKSUM = "file://COPYING;md5=441c28d2cf86e15a37fa47e15a72fbac"
+
 PR = "r0"
 
 DEPENDS = " \
@@ -19,6 +22,7 @@ S = "${WORKDIR}"
 
 SRC_URI = " \
 	file://${PN}			\
+	file://COPYING 			\
 "
 
 do_install() {
